@@ -134,6 +134,7 @@ demo.py                end-to-end demo
 tests/                 the extracted production tests plus tests for the condensed parts
 ```
 
-## License
+## Notice
 
-MIT. See `LICENSE`.
+Internal working tooling. All rights reserved, no license granted.
+See `NOTICE.md`.

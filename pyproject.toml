@@ -7,7 +7,6 @@ name = "pr-triage-engine"
 version = "0.1.0"
 description = "Turns noisy CI results into one confident PR-readiness verdict, and posts it without spamming the thread."
 readme = "README.md"
-license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = ["requests>=2.28"]
 
