@@ -245,5 +245,23 @@ class PreviewThreadAware(unittest.TestCase):
         self.assertTrue(pv["body"].startswith("Hi @dev-a @dev-c, dev-a offered"))
 
 
+
+# 2.254.0: the refresh is opt-in (PRTRIAGE_GH_REFRESH=1); these tests exercise the opt-in path.
+_saved_refresh = None
+
+
+def setUpModule():
+    global _saved_refresh
+    _saved_refresh = os.environ.get("PRTRIAGE_GH_REFRESH")
+    os.environ["PRTRIAGE_GH_REFRESH"] = "1"
+
+
+def tearDownModule():
+    if _saved_refresh is None:
+        os.environ.pop("PRTRIAGE_GH_REFRESH", None)
+    else:
+        os.environ["PRTRIAGE_GH_REFRESH"] = _saved_refresh
+
+
 if __name__ == "__main__":
     unittest.main()

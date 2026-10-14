@@ -147,8 +147,8 @@ def main() -> int:
             pv = comments.preview_pr_verdict_action(r["url"], r["body"], TOKEN)
             res = comments.upsert_pr_verdict_comment(r["url"], r["body"], TOKEN)
             notes = []
-            if pv.get("quiet"):
-                notes.append("thread moved on, nothing new: edited in place")
+            if pv.get("quiet") or res.get("action") == "updated":
+                notes.append("same conclusion: edited in place")
             if pv.get("fixes"):
                 notes.append("leads with the offered fix")
             first = (pv.get("body") or r["body"]).split("\n", 1)[0]

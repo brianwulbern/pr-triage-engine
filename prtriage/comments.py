@@ -201,6 +201,15 @@ _GREETING_RE = re.compile(r"^Hi ((?:@[\w-]+\s*)+)")
 _BEHIND_NUM_RE = re.compile(r"\b(\d+)( commit\(s\) behind)")
 
 
+def _refresh_enabled() -> bool:
+    """2.254.0: an UNCHANGED verdict is edited in place by default, never posted again as a
+    fresh comment. The 2.189 refresh (re-post at the bottom once the thread moved on) put three
+    same-conclusion verdicts on #1234 while the dev was already discussing the fix; a new
+    comment now means a new conclusion. PRTRIAGE_GH_REFRESH=1 turns the refresh back on."""
+    return (os.environ.get("PRTRIAGE_GH_REFRESH") == "1"
+            and os.environ.get("PRTRIAGE_NO_GH_REFRESH") != "1")
+
+
 def _is_human_login(login: str) -> bool:
     return bool(login) and not _is_ci_bot_login(login) and not login.endswith("[bot]")
 
@@ -308,12 +317,27 @@ def _post_substance(body: Optional[str]) -> str:
     is not a change; crossing into rebase-needed territory is."""
     from . import config
     thresh = config.STALE_REBASE_BEHIND_THRESHOLD
-    lines = [ln.rstrip() for ln in (body or "").splitlines()
+    # 2.276.1: compare as posted: a comment from before the em-dash cleanup is the same
+    # substance as today's, so it must not read as "moved on" and repost
+    lines = [ln.rstrip() for ln in public_text(body or "").splitlines()
              if not ln.lstrip().startswith(_VERDICT_MARKER_PREFIX)]
     txt = "\n".join(lines).strip()
     return _BEHIND_NUM_RE.sub(
         lambda m: ("rebase-needed" if int(m.group(1)) > thresh else "within-range")
         + m.group(2), txt)
+
+
+_FENCE_RE = re.compile(r"(```.*?```)", re.S)
+
+
+def public_text(md: str) -> str:
+    """2.276.1: prtriage's terminal wording uses em-dashes; a GitHub comment is public text,
+    which never carries one (the team's rule). Replace each outside fenced code blocks,
+    so a quoted diff or log is left exactly as it is. Hidden markers carry none."""
+    parts = _FENCE_RE.split(md or "")
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"[ \t]*\u2014[ \t]*", ": ", parts[i]).replace("\u2014", ", ")
+    return "".join(parts)
 
 
 def preview_pr_verdict_action(
@@ -356,8 +380,7 @@ def preview_pr_verdict_action(
                        and new_sig != prev_sig)
     # 2.189.0: mirror upsert - an unchanged verdict on a thread that moved on since prtriage's
     # last comment REFRESHES (fresh bottom-of-thread comment), not an invisible in-place edit.
-    refresh = (not verdict_changed and later_activity
-               and os.environ.get("PRTRIAGE_NO_GH_REFRESH") != "1")
+    refresh = (not verdict_changed and later_activity and _refresh_enabled())
     # 2.239.0: ...unless there's nothing new to say - then edit in place, don't post a copy.
     quiet = refresh and _post_substance(prev_body) == _post_substance(composed)
     if quiet:
@@ -388,6 +411,7 @@ def upsert_pr_verdict_comment(
     upgrade re-judged the same run - posts a NEW comment ("reposted"), leaving the prior
     one as a paper trail. Missing signature on either side → fall back to edit-in-place
     (conservative: never spawn a duplicate when we can't confirm the verdict moved)."""
+    verdict_md = public_text(verdict_md)            # 2.276.1: public text, no em-dashes
     if not token:
         return {"ok": False, "error": "no GitHub token (set PRTRIAGE_GITHUB_TOKEN)"}
     m = _PR_PARTS_REGEX.match((pr_url or "").strip())
@@ -425,13 +449,13 @@ def upsert_pr_verdict_comment(
     # edit the latest in place.
     verdict_changed = (prev_id is not None and new_sig is not None
                        and prev_sig is not None and new_sig != prev_sig)
-    # 2.189.0: even an UNCHANGED verdict re-surfaces as a FRESH comment at the bottom when
+    # 2.189.0 (opt-in since 2.254.0, PRTRIAGE_GH_REFRESH=1): an UNCHANGED verdict re-surfaces as a FRESH comment when
     # the thread has moved on since prtriage's last one (a new reply or ci:test:relevant result),
     # because an in-place edit near the top of a long thread is invisible. Opt out with
     # PRTRIAGE_NO_GH_REFRESH=1. Self-limiting: the fresh comment becomes the newest prtriage comment,
     # so it won't repost again until there's NEW activity after it.
     refresh = (prev_id is not None and not verdict_changed and later_activity
-               and os.environ.get("PRTRIAGE_NO_GH_REFRESH") != "1")
+               and _refresh_enabled())
     # 2.239.0 (#1234): lead with any fix offered in the thread, and don't post a fresh
     # copy when nothing but volatile numbers changed (edit the latest in place instead).
     fixes = _thread_offered_fixes(owner, repo, number, headers, timeout, thread)
