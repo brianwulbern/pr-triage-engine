@@ -295,18 +295,24 @@ def _compose_post_body(verdict_md: str, fixes: List[Dict[str, Any]]) -> str:
     sig = _verdict_sig(verdict_md)
     if sig and sig.startswith("🟢"):
         return verdict_md
+    first, sep, rest = verdict_md.partition("\n")
+    m = _GREETING_RE.match(first)
+    offerers = {f["login"].lower() for f in fixes[:3]}
+    greeted = [h for h in (m.group(1).split() if m else []) if h[1:].lower() not in offerers]
+    thank = bool(m) and not greeted
     parts = []
     for f in fixes[:3]:
         sha7 = f["sha"][:7]
         ref = f"[`{sha7}`]({f['commit_url']})" if f.get("commit_url") else f"`{sha7}`"
         where = f" ([comment]({f['comment_url']}))" if f.get("comment_url") else ""
-        parts.append(f"{f['login']} offered a fix: cherry-pick {ref}{where}")
+        parts.append(f"thanks @{f['login']} for the fix: cherry-pick {ref}{where}" if thank
+                     else f"{f['login']} offered a fix: cherry-pick {ref}{where}")
     lead = ("; ".join(parts) + ". prtriage's read below doesn't account for it yet; once it's "
             "applied, re-run `ci:test:relevant` and prtriage will re-judge on the new build.")
-    first, sep, rest = verdict_md.partition("\n")
-    m = _GREETING_RE.match(first)
+    if thank:
+        return f"{lead[0].upper()}{lead[1:]}{sep}{rest}"
     if m:
-        return f"Hi {m.group(1).strip()}, {lead}{sep}{rest}"
+        return f"Hi {' '.join(greeted)}, {lead}{sep}{rest}"
     return f"💬 {lead}\n\n{verdict_md}"
 
 

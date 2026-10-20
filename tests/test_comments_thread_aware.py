@@ -109,7 +109,7 @@ class ComposePostBody(unittest.TestCase):
     def test_greeting_replaced_mentions_kept(self):
         out = P._compose_post_body(_verdict(), [self.FIX])
         first = out.split("\n", 1)[0]
-        self.assertTrue(first.startswith("Hi @dev-a @dev-c, dev-a offered a fix"))
+        self.assertTrue(first.startswith("Hi @dev-c, dev-a offered a fix"))
         self.assertIn(f"[`1a2b3c4`]({FIX_URL})", first)
         self.assertIn("issuecomment-1001", first)
         self.assertNotIn("it needs a change to the PR itself", first)
@@ -242,7 +242,7 @@ class PreviewThreadAware(unittest.TestCase):
             pv = P.preview_pr_verdict_action(PR, _verdict(82), token="tok")
         self.assertEqual(pv["action"], "refresh")
         self.assertFalse(pv["quiet"])
-        self.assertTrue(pv["body"].startswith("Hi @dev-a @dev-c, dev-a offered"))
+        self.assertTrue(pv["body"].startswith("Hi @dev-c, dev-a offered"))
 
 
 
