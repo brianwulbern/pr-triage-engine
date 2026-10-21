@@ -163,6 +163,24 @@ def _run_error_text(run: Dict[str, Any]) -> str:
     )
 
 
+# 3.0.50 (#1234): ReportService's history rows carry reportBuildId but no build name, so the
+# PR-name filter below never matched and a pull's own earlier runs counted as independent
+# flake evidence. The PR-level triage registers every build of the pull here.
+_OWN_BUILDS: Dict[str, set] = {}
+
+
+def register_own_builds(pr_string: Optional[str], build_ids) -> None:
+    if pr_string:
+        _OWN_BUILDS[pr_string.upper()] = {str(b) for b in build_ids if b}
+
+
+def _own_run(run: Dict[str, Any], pr_string: Optional[str]) -> bool:
+    if not pr_string:
+        return False
+    return (pr_string.upper() in _run_build_name(run)
+            or str(run.get("reportBuildId")) in _OWN_BUILDS.get(pr_string.upper(), ()))
+
+
 def _run_build_name(run: Dict[str, Any]) -> str:
     return str(
         run.get("buildName")
@@ -193,7 +211,7 @@ def _consecutive_failures_count(
     for run in history_data.get("items", []):
         if str(run.get("reportCaseResultId")) == str(current_case_result_id):
             continue
-        if pr_string and pr_string in _run_build_name(run):
+        if _own_run(run, pr_string):
             continue
         if _run_status(run) == "FAILED":
             count += 1
@@ -393,7 +411,7 @@ def classify_failure(
     for run in history_data.get("items", []):
         if str(run.get("reportCaseResultId")) == str(current_case_result_id):
             continue
-        if pr_string and pr_string in _run_build_name(run):
+        if _own_run(run, pr_string):
             # Re-triggers from the same PR aren't independent - they're all
             # measuring the same (buggy or not) code.
             continue
