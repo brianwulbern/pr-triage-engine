@@ -56,8 +56,32 @@ def _pr_current_state(owner: str, repo: str, number, token: Optional[str],
         return None
 
 
+# Logins that are never the person to @-mention for action: the CI/forwarding
+# automation (ci-bot*) and upstream-fork (the fork the
+# backport is forwarded INTO - it shows up as a commit author by artifact, not because
+# a human there is responsible for the PR).
+# 2.273.0: product-release is the account the backport bot commits its cherry-picks as; #1234 greeted
+# and assigned it as the dev.
+_NON_AUTHOR_LOGINS = frozenset({"upstream-fork", "product-release", "web-flow"})
+
+
 def _is_ci_bot_login(login: Optional[str]) -> bool:
     return bool(login) and str(login).startswith("ci-bot")
+
+
+_VIEWER: Dict[str, str] = {}
+
+
+def _viewer_login(token: Optional[str]) -> str:
+    """The token owner's login, memoized; "" when it can't be read."""
+    if not token:
+        return ""
+    if token not in _VIEWER:
+        try:
+            _VIEWER[token] = resolve_viewer_login(token)
+        except Exception:  # noqa: BLE001
+            return ""
+    return _VIEWER[token]
 
 
 # --------------------------------------------------------------------------
@@ -502,3 +526,64 @@ def upsert_pr_verdict_comment(
         hint = " - PR not found or token can't see it"
     return {"ok": False,
             "error": f"HTTP {resp.status_code} on {action[:-1]}e{hint}"}
+
+
+# Bots we never assign / never treat as human authors.
+_ASSIGN_BOT_LOGINS = frozenset({
+    "ci-bot", "ci-bot-hu", "product-release"})
+
+
+def add_pr_labels(owner: str, repo: str, number, labels, token: Optional[str],
+                  timeout: int = 30) -> dict:
+    """ADD labels to a PR, ADDITIVELY. POST /issues/{n}/labels appends to the existing set
+    (never replaces - so other labels stay). {'ok': bool, 'error': str}. Never raises."""
+    labels = [x for x in (labels or []) if x]
+    if not token or not labels:
+        return {"ok": False, "error": "no token or no labels"}
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"token {token}"}
+    try:
+        resp = governor.governed(lambda: http_cache.gh_post(
+            f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels",
+            headers=headers, json={"labels": labels}, timeout=timeout))
+    except Exception as exc:  # noqa: BLE001 - best-effort, never crash the post
+        return {"ok": False, "error": f"request failed: {exc}"}
+    if resp.status_code in (200, 201):
+        return {"ok": True}
+    return {"ok": False, "error": f"HTTP {resp.status_code}"}
+
+
+def remove_pr_label(owner: str, repo: str, number, label: str, token: Optional[str],
+                    timeout: int = 30) -> dict:
+    """2.221.0: remove ONE label from a PR. DELETE /issues/{n}/labels/{label}. A 404 means the
+    label wasn't there - treated as ok (idempotent). {'ok': bool, 'error': str}. Never raises."""
+    if not token or not label:
+        return {"ok": False, "error": "no token or no label"}
+    headers = {"Accept": "application/vnd.github+json", "Authorization": f"token {token}"}
+    import urllib.parse as _up
+    url = (f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels/"
+           f"{_up.quote(label)}")
+    try:
+        resp = governor.governed(lambda: http_cache.gh_delete(
+            url, headers=headers, timeout=timeout))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"request failed: {exc}"}
+    if resp.status_code in (200, 404):
+        return {"ok": True}
+    return {"ok": False, "error": f"HTTP {resp.status_code}"}
+
+
+def resolve_viewer_login(token: str, timeout: int = 30) -> str:
+    """The authenticated user's GitHub login (the token owner), via GET /user - so
+    `prtriage pulls --me` can filter to PRs assigned to whoever's token this is, without the
+    user having to type their own login. Raises on a non-200 (a silent empty would make
+    --me quietly match nothing)."""
+    resp = governor.governed(lambda: http_cache.gh_get(
+        "https://api.github.com/user",
+        headers={"Accept": "application/vnd.github+json",
+                 "Authorization": f"token {token}"},
+        timeout=timeout,
+    ))
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"GitHub /user HTTP {resp.status_code}: {resp.text[:200]}")
+    return ((resp.json() or {}).get("login")) or ""

@@ -62,3 +62,21 @@ MIN_COVERAGE = 0.5
 # How far behind base a branch can drift before a rebase is actually needed. The comment engine
 # treats a behind-count change as news only when it crosses this line.
 STALE_REBASE_BEHIND_THRESHOLD = 200
+
+# --- AI-resolved merge conflicts -------------------------------------------------------------
+# The backport bot labels a pull whose merge conflict a model resolved. It holds until a person
+# other than the forwarder signs off (an Approve review or an LGTM comment from an org member),
+# then the sign-off label is added. One reminder after this many working days.
+AI_CONFLICT_LABEL = "ai-resolved-conflict"
+AI_CONFLICT_SIGNOFF_LABEL = "ai-resolution-signed-off"
+AI_REVIEW_REMIND_WORKDAYS = 2
+# A team can route these reviews to one person: a pull that changes a path CODEOWNERS gives the
+# team, or whose commit author is on it, asks only this reviewer.
+PLATFORM_TEAM_CODEOWNER = "platform-core"
+PLATFORM_TEAM_MEMBERS = ("core-dev-a", "core-dev-b", "core-dev-c")
+PLATFORM_TEAM_AI_REVIEWER = "core-reviewer"
+POSTABLE_REPO_PREFIX = "example-org/"
+
+# --- re-run reconciliation -------------------------------------------------------------------
+# How many earlier runs of the same trigger a pull's latest run is compared against.
+RECONCILE_MAX_RUNS_PER_TRIGGER = 3

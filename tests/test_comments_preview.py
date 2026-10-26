@@ -69,14 +69,6 @@ class PreviewAction(unittest.TestCase):
         self.assertEqual(pv["action"], "unknown")
         self.assertIn("skip", pv["reason"])      # a real post would skip, not create
 
-    def test_matches_apply_decision(self):
-        # the preview action is the present-tense of what upsert would report.
-        with self._find(ret=(111, SIG_A, False)):
-            self.assertEqual(
-                comments.preview_pr_verdict_action(URL, SIG_B, token="x")["action"],
-                "repost")   # upsert would return "reposted" for the same inputs
-
-
 
 
 

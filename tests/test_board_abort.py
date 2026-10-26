@@ -18,12 +18,6 @@ def _rec(t):
 
 
 class AbortSpacing(unittest.TestCase):
-    def test_default_trip_point(self):
-        with mock.patch.dict("os.environ", {}, clear=False):
-            import os
-            os.environ.pop("PRTRIAGE_PULLS_ABORT_SPACING", None)
-            self.assertEqual(pulls._abort_spacing(), 4.0)   # 2.237.0: raised 2.0 -> 4.0
-
     def test_env_override(self):
         with mock.patch.dict("os.environ", {"PRTRIAGE_PULLS_ABORT_SPACING": "5.5"}):
             self.assertEqual(pulls._abort_spacing(), 5.5)

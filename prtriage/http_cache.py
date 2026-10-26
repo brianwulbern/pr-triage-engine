@@ -3,7 +3,7 @@
 A GitHub conditional request (`If-None-Match: <etag>`) that comes back **304 Not
 Modified does NOT count against the REST rate limit** - so a resource re-read while
 unchanged is free. prtriage re-reads the same PR constantly: a dev re-run, a `--batch`
-sweep's working set, and now the lpr forward interlock re-triaging the very PR the dev
+sweep's working set, and now the forward script interlock re-triaging the very PR the dev
 just triaged. This stores each GET's ETag + body under XDG and revalidates on the next
 read: 304 → serve the cached body for free; 200 → GitHub changed, refresh. Correctness
 is GitHub's to keep - we only reuse a body when the server confirms it's unchanged.

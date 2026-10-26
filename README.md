@@ -101,6 +101,26 @@ reveals an active secondary limit). If the governor falls into a crawl mid-run, 
 with a partial result instead of grinding, but only when enough PRs remain for grinding to be the
 worse option: a short tail always finishes.
 
+### Sign-off hold for AI-resolved conflicts (`prtriage/ai_review.py`)
+
+When the backport bot lets a model resolve a merge conflict, the pull is held until a person who
+isn't the forwarder signs off: an Approve review or a short `LGTM` comment from an org member,
+newer than the pull's head. A push after the sign-off holds it again.
+
+* **One ask per person.** Pulls waiting on the same authors get a single mention that lists the
+  others; the rest get a pointer comment with no mention.
+* **One reminder, then escalation.** Two working days without a sign-off get one reminder; after
+  that the board suggests asking someone else rather than posting again.
+* **Team routing.** A pull that changes code CODEOWNERS gives a team, or that a team member wrote,
+  asks that team's designated reviewer instead of each author.
+
+### Re-run reconciliation (`prtriage/run_reconciliation.py`)
+
+A pull's trigger is often built more than once. Comparing a test across those runs is the strongest
+reliability signal there is: at the same commit, a test that passed and then failed is flaky, and
+one that failed every time reproduced. A pass from a run whose compile gate was red doesn't count,
+since that run never built the code that fails now.
+
 ## Try the demo
 
 ```bash
@@ -128,6 +148,10 @@ prtriage/
   comments.py          idempotent, thread-aware verdict comments
   board.py             concurrent readiness board
   board_limits.py      rate-limit preflight and early-abort decisions
+  ai_review.py         sign-off hold for AI-resolved merge conflicts
+  run_reconciliation.py  cross-run reconciliation of a pull's re-runs
+  build_transition.py  a build's tests split by outcome
+  github_writes.py     the comment write the sign-off hold uses
   config.py            tunables
   mocks.py             synthetic history + in-memory GitHub
 demo.py                end-to-end demo
