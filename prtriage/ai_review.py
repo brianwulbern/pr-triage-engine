@@ -12,7 +12,7 @@ such pull forwards until a person has checked the resolution:
 * sign-off is a GitHub Approve review or an `LGTM` comment, or the `ai-resolution-signed-off`
   label added by hand, from a member of the repository's GitHub org (`product`). Never the bot that
   opened the pull and never the person forwarding it (the token owner), so a second person
-  always looks at the model's work;
+  always looks at the model's work. 3.0.62: an opener who also wrote the commits can sign;
 * only a sign-off newer than the pull's head commit counts: a push after it holds the pull again;
 * a later "Request changes" review undoes an earlier sign-off.
 
@@ -47,6 +47,14 @@ _LGTM_RE = re.compile(
     r"(?:lgtm|(?:(?:all|it|everything)\s+)?looks?\s+good(?:\s+to\s+me)?)"
     r"[\s,.!:]*(?:(?:thanks|thank you|ty)[\s.!]*)?$",
     re.IGNORECASE)
+# 3.0.63: "LGTM." followed by an explanation counts when the explanation carries no condition,
+# doubt or problem (dev-u on #1234).
+# 3.0.64: also an LGTM on its own line (#1234), and only words that put a condition on the
+# sign-off hold it back; evidence such as "failed on every base run" doesn't (#1234, #1234).
+_FIRST_SENTENCE_RE = re.compile(r"(.+?(?:[.!]|(?=\n)))\s+(.+)$", re.DOTALL)
+_HEDGE_RE = re.compile(
+    r"\?|\b(?:once|if|when|until|unless|but|however|though|although|pending|still|needs?|"
+    r"needed|should|must|please|wait)\b", re.IGNORECASE)
 
 
 def is_ai_resolved(labels: Optional[Iterable[str]]) -> bool:
@@ -57,7 +65,11 @@ def is_lgtm(body: Optional[str]) -> bool:
     if not body or body.lstrip().startswith("<!-- prtriage-"):
         return False
     text = "".join(ch for ch in body if ord(ch) < 0x2000).strip()   # drop emoji
-    return bool(_LGTM_RE.match(text))
+    if _LGTM_RE.match(text):
+        return True
+    m = _FIRST_SENTENCE_RE.match(text)
+    return bool(m and _LGTM_RE.match(m.group(1))
+                and not _HEDGE_RE.search(re.sub(r"`[^`]*`", "", m.group(2))))
 
 
 def _is_bot(login: str, user_type: str = "") -> bool:
@@ -116,6 +128,27 @@ def find_signer(reviews: List[Dict[str, Any]], comments: List[Dict[str, Any]],
             continue
         best = (login, how, at)
         break
+    return best
+
+
+def author_reply(comments: List[Dict[str, Any]], reviews: List[Dict[str, Any]],
+                 authors: Iterable[str], since: str) -> Optional[Tuple[str, str, str]]:
+    """3.0.62: (login, at, url) of an author's newest comment or review after `since`, `ci:`
+    commands aside. An author who answered is waiting on a person to read it, not on a
+    reminder (#1234)."""
+    who = {(a or "").lower() for a in authors}
+    if not since or not who:
+        return None
+    best = None
+    for c, at_key in [(c, "created_at") for c in comments or []] + \
+                     [(r, "submitted_at") for r in reviews or []]:
+        login = ((c.get("user") or {}).get("login") or "")
+        body = (c.get("body") or "").strip()
+        at = c.get(at_key) or ""
+        if login.lower() not in who or not body or body.lower().startswith("ci:") or at <= since:
+            continue
+        if not best or at > best[1]:
+            best = (login, at, c.get("html_url") or "")
     return best
 
 
@@ -317,11 +350,13 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
     reminders = [c.get("created_at") or "" for c in comments if ours(c, _REMIND_MARKER)]
     st["asked_at"] = min([a for a in asks if a], default="")
     st["reminded_at"] = max([a for a in reminders if a], default="")
+    st["replied"] = author_reply(comments, reviews, st["authors"], st["asked_at"])
     st["requests"] = review_requests(pull, events, reviews, st["authors"])
     requested = [at for at in (st["requests"].get("asked") or {}).values() if at]
     if requested:
         st["asked_at"] = min([st["asked_at"]] + requested if st["asked_at"] else requested)
-    excluded = [((pull.get("user") or {}).get("login") or ""), viewer]
+    opener = (pull.get("user") or {}).get("login") or ""
+    excluded = [viewer] + ([] if opener.lower() in {x.lower() for x in st["authors"]} else [opener])
     is_member = _members(owner, token)
     st["signer"] = find_signer(reviews, comments, events, head_at, excluded, is_member, sha)
     if not st["signer"]:
@@ -436,12 +471,12 @@ def waiting_text(st: Dict[str, Any]) -> str:
 
 
 def classify(records: List[Dict[str, Any]], token: Optional[str],
-             repo_filter: str, now: Optional[datetime.date] = None
-             ) -> Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]]:
+             repo_filter: str, now: Optional[datetime.date] = None,
+             replaced: Optional[Dict[str, str]] = None) -> Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]]:
     from . import comments
     out: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]] = {
         "ask": [], "release": [], "rehold": [], "waiting": [], "unreadable": [],
-        "remind": [], "overdue": [], "landed": []}
+        "remind": [], "overdue": [], "landed": [], "replaced": [], "replied": []}
     seen: set = set()
     for r in records:
         target = ((r.get("_audit") or {}).get("target") or "").strip()
@@ -463,8 +498,12 @@ def classify(records: List[Dict[str, Any]], token: Optional[str],
             out["rehold"].append(row)
         elif _landed(r):
             out["landed"].append(row)
+        elif num in (replaced or {}):
+            out["replaced"].append(row)
         elif not st.get("noticed") and not (st.get("requests") or {}).get("asked"):
             out["ask"].append(row)
+        elif st.get("replied"):
+            out["replied"].append(row)
         elif _due(st.get("reminded_at") or st.get("asked_at"), now):
             out["overdue" if st.get("reminded_at") else "remind"].append(row)
         else:
@@ -498,10 +537,11 @@ def _due(since: Optional[str], now: Optional[datetime.date]) -> bool:
 
 def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
                repo_filter: str, interactive: bool,
-               prompt: Callable[[str], str]) -> None:
+               prompt: Callable[[str], str],
+               replaced: Optional[Dict[str, str]] = None) -> None:
     """Print the AI-resolution holds and, on `apply` or a [y/N], ask / release / re-hold."""
     from . import github_writes, comments
-    c = classify(records, token, repo_filter)
+    c = classify(records, token, repo_filter, replaced=replaced)
     if not any(c.values()):
         return
     print("\n" + "─" * 70)
@@ -528,6 +568,13 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     for _o, _r, num, st in c["overdue"]:
         print(f"    ⏰ #{num}  reminded {st['reminded_at'][:10]}, still no sign-off: ask someone "
               f"else in the `product` org to review it")
+    for _o, _r, num, st in c["replied"]:
+        login, at, url = st["replied"]
+        print(f"    💬 #{num}  @{login} replied {at[:10]}, no reminder: read it"
+              + (f" ({url})" if url else ""))
+    for _o, _r, num, _st in c["replaced"]:
+        print(f"    ⏭  #{num}  #{replaced[num]} carries the same ticket on this branch and goes "
+              f"forward, no ask")
     for _o, _r, num, _st in c["landed"]:
         print(f"    ⏭  #{num}  already on the upstream fork, no ask (close it instead)")
     if c["unreadable"]:

@@ -420,7 +420,32 @@ def preview_pr_verdict_action(
             "url": f"https://github.com/{owner}/{repo}/pull/{number}"
                    f"#issuecomment-{prev_id}",
             "prev_sig": prev_sig, "new_sig": new_sig,
-            "body": composed, "fixes": fixes, "quiet": quiet}
+            "body": composed, "fixes": fixes, "quiet": quiet,
+            "replies": thread_replies(thread, prev_id, _viewer_login(token))}
+
+
+def thread_replies(thread: list, since_id: int, viewer: str = "") -> List[Dict[str, object]]:
+    """3.0.65: the human comments posted after prtriage's verdict comment `since_id`, oldest
+    first, each {login, at, url, mentions_me}. CI commands and bots don't count. 3.0.66:
+    nor does anything you already answered with a comment of your own."""
+    since = next((c.get("created_at") or "" for c in thread if c.get("id") == since_id), "")
+    if not since:
+        return []
+    if viewer:
+        since = max([since] + [c.get("created_at") or "" for c in thread if not c.get("prtriage")
+                               and (c.get("login") or "").lower() == viewer.lower()
+                               and not (c.get("body") or "").strip().lower().startswith("ci:")])
+    me = re.compile(rf"@{re.escape(viewer)}\b", re.IGNORECASE) if viewer else None
+    out = []
+    for c in thread:
+        body = (c.get("body") or "").strip()
+        if (c.get("prtriage") or not _is_human_login(c.get("login") or "") or not body
+                or body.lower().startswith("ci:") or (c.get("created_at") or "") <= since
+                or (viewer and (c.get("login") or "").lower() == viewer.lower())):
+            continue
+        out.append({"login": c.get("login"), "at": c.get("created_at") or "",
+                    "url": c.get("url") or "", "mentions_me": bool(me and me.search(body))})
+    return out
 
 
 def upsert_pr_verdict_comment(
