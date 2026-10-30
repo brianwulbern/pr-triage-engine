@@ -5,6 +5,7 @@ generic defaults so the showcase runs; the shapes (types, meaning) match the rea
 """
 from __future__ import annotations
 
+import os
 import re
 
 # --- classifier: history-based flake detection -------------------------------------------
@@ -80,3 +81,18 @@ POSTABLE_REPO_PREFIX = "example-org/"
 # --- re-run reconciliation -------------------------------------------------------------------
 # How many earlier runs of the same trigger a pull's latest run is compared against.
 RECONCILE_MAX_RUNS_PER_TRIGGER = 3
+
+# --- board cache / deep-record cache -----------------------------------------------------------
+# A red or review row ages out after this; the deep-record cache ages every row out after it.
+PULLS_CACHE_TTL_SECONDS = int(os.environ.get("PULLS_CACHE_TTL_SECONDS") or 24 * 3600)
+# Bumped by a release that changes what a verdict says, so cached verdicts made before it miss.
+VERDICT_LOGIC = 23
+
+# --- deep analysis model chain ---------------------------------------------------------------
+DEEP_ANALYSIS_MODEL_ENV = "PRTRIAGE_DEEP_MODEL"
+DEEP_ANALYSIS_MODEL_FALLBACKS = ("claude-opus-5-5", "claude-sonnet-5-5")
+
+
+def cache_root() -> str:
+    """The cache base every file lives under: $XDG_CACHE_HOME, else ~/.cache."""
+    return os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
