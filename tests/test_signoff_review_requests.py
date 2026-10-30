@@ -84,7 +84,7 @@ class PullState(unittest.TestCase):
     def test_anyone_in_the_org_can_still_sign_off(self):
         st = self._state(_requested(_pull([config.AI_CONFLICT_LABEL]), "alice"),
                          reviews=[_rev("bob", "APPROVED", AFTER)], events=[_req("alice")])
-        self.assertFalse(A.held(st))
+        self.assertTrue(st["signer"] and st["signer"][0] == "bob")
 
 
 class BoardStep(unittest.TestCase):

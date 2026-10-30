@@ -40,6 +40,8 @@ _REMIND_MARKER = "<!-- prtriage-ai-review-reminder -->"
 # The whole comment is the sign-off, so it can't be read out of a longer remark ("LGTM once
 # the test passes" doesn't count). Trailing thanks and emoji are allowed. 3.0.51: also a short
 # "tested it locally and it looks good" with a leading mention (dev-r, #1234/#1234).
+# 3.0.84: also after a greeting ("Hi @release-mgr\nLGTM", dev-n on #1234).
+_GREETING_RE = re.compile(r"^(?:hi|hello|hey|hola)\b[\s,!]*(?:@[\w-]+[\s,:]*)*", re.IGNORECASE)
 _LGTM_RE = re.compile(
     r"^(?:@[\w-]+[\s,:]*)*(?:(?:thanks|thank you)[\s,.!]*)?"
     r"(?:(?:i\s+)?(?:tested|checked|reviewed|verified)\s+(?:this|it|the\s+(?:resolution|changes?|pull|pr))"
@@ -65,11 +67,66 @@ def is_lgtm(body: Optional[str]) -> bool:
     if not body or body.lstrip().startswith("<!-- prtriage-"):
         return False
     text = "".join(ch for ch in body if ord(ch) < 0x2000).strip()   # drop emoji
+    text = _GREETING_RE.sub("", text, count=1)
     if _LGTM_RE.match(text):
         return True
     m = _FIRST_SENTENCE_RE.match(text)
     return bool(m and _LGTM_RE.match(m.group(1))
                 and not _HEDGE_RE.search(re.sub(r"`[^`]*`", "", m.group(2))))
+
+
+# 3.0.69: a sentence that signs off the resolution by name counts wherever it sits in the
+# comment ("As this push needs a new sign-off, LGTM for the new resolution.", dev-s on
+# #1234), unless that sentence puts a condition on it.
+_RESOLUTION_LGTM_RE = re.compile(
+    r"\b(?:lgtm|looks?\s+good(?:\s+to\s+me)?)\s+(?:for|on)\s+the\s+"
+    r"(?:(?:new|updated|ai|rebased)\s+)?(?:conflict\s+)?resolution\b", re.IGNORECASE)
+_SENTENCE_HEDGE_RE = re.compile(
+    r"\?|\b(?:once|if|when|until|unless|pending|but|however|though|although|wait)\b",
+    re.IGNORECASE)
+
+
+def signs_off_resolution(body: Optional[str]) -> bool:
+    if is_lgtm(body) or _checked(body):
+        return True
+    if not body or body.lstrip().startswith("<!-- prtriage-"):
+        return False
+    text = re.sub(r"`[^`]*`", "", body)
+    return any(_RESOLUTION_LGTM_RE.search(s) and not _SENTENCE_HEDGE_RE.search(s)
+               for s in re.findall(r"[^.!?\n]+[.!?]?", text))
+
+
+# 3.0.83: a short "I already checked the three of them and ran them locally" answering prtriage's
+# grouped ask counts (dev-r on #1234), as long as nothing in it is a condition or a problem.
+# A plural object signs off every pull of that ask, not just the one it was posted on.
+_CHECKED_RE = re.compile(
+    r"^(?:i\s+)?(?:(?:have|already|also)\s+|'ve\s+)*(?:checked|reviewed|tested|verified)\s+"
+    r"(?P<obj>the\s+(?:two|three|four|five|six|\d+)\s+of\s+them"
+    r"|all\s+(?:two|three|four|five|six|\d+|of\s+them)|them\s+all|both(?:\s+of\s+them)?"
+    r"|these|them|this(?:\s+one)?|it|the\s+(?:resolutions?|changes?|pulls?|prs?))\b",
+    re.IGNORECASE)
+_PLURAL_RE = re.compile(r"\b(?:them|all|both|these|resolutions|changes|pulls|prs)\b",
+                        re.IGNORECASE)
+_PROBLEM_RE = re.compile(
+    r"n't\b|\b(?:not|no|never|cannot|fail\w*|error\w*|broken|break\w*|wrong|issues?|problems?|"
+    r"missing|conflicts?)\b", re.IGNORECASE)
+_CHECKED_MAX = 200
+
+
+def _checked(body: Optional[str]) -> Optional[str]:
+    if not body or body.lstrip().startswith("<!-- prtriage-"):
+        return None
+    text = re.sub(r"@[\w-]+", "", re.sub(r"`[^`]*`", "", body))
+    text = " ".join("".join(ch for ch in text if ord(ch) < 0x2000).split()).strip(" ,:")
+    m = _CHECKED_RE.match(text)
+    if not m or len(text) > _CHECKED_MAX or _HEDGE_RE.search(text) or _PROBLEM_RE.search(text):
+        return None
+    return m.group("obj")
+
+
+def signs_off_group(body: Optional[str]) -> bool:
+    obj = _checked(body)
+    return bool(obj and _PLURAL_RE.search(obj))
 
 
 def _is_bot(login: str, user_type: str = "") -> bool:
@@ -109,9 +166,9 @@ def find_signer(reviews: List[Dict[str, Any]], comments: List[Dict[str, Any]],
             block_at = max(block_at, at)
     for c in comments or []:
         user = c.get("user") or {}
-        if is_lgtm(c.get("body")):
-            cands.append((c.get("created_at") or "", user.get("login") or "", "LGTM comment",
-                          user.get("type") or ""))
+        if signs_off_resolution(c.get("body")):
+            cands.append((c.get("created_at") or "", user.get("login") or "",
+                          c.get("_how") or "LGTM comment", user.get("type") or ""))
     for e in events or []:
         if (e.get("event") == "labeled"
                 and (e.get("label") or {}).get("name") == config.AI_CONFLICT_SIGNOFF_LABEL):
@@ -360,11 +417,47 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
     is_member = _members(owner, token)
     st["signer"] = find_signer(reviews, comments, events, head_at, excluded, is_member, sha)
     if not st["signer"]:
+        group = group_signoffs(owner, repo, num, comments, viewer, token)
+        if group:
+            st["signer"] = find_signer(reviews, comments + group, events, head_at, excluded,
+                                       is_member, sha)
+    pushed = max([head_at] + [e.get("created_at") or "" for e in events
+                              if e.get("event") == "head_ref_force_pushed"])
+    labeled = [e.get("created_at") or "" for e in events if e.get("event") == "labeled"
+               and (e.get("label") or {}).get("name") == config.AI_CONFLICT_SIGNOFF_LABEL]
+    st["label_fresh"] = st["signed_label"] and max(labeled, default="") > pushed
+    if not st["signer"]:
         st["stale"] = find_signer(reviews, comments, events, "", excluded, is_member)
     return st
 
 
 _STATES: Dict[str, Dict[str, Any]] = {}
+_GROUP_MAX = 12
+
+
+def _group_refs(comments: List[Dict[str, Any]], viewer: Optional[str]) -> set:
+    me = (viewer or "").lower()
+    return {n for c in comments or []
+            if ((c.get("user") or {}).get("login") or "").lower() == me
+            and (c.get("body") or "").lstrip().startswith((_MARKER, _REMIND_MARKER))
+            for n in re.findall(r"#(\d+)", c.get("body") or "")}
+
+
+def group_signoffs(owner: str, repo: str, num: str, comments: List[Dict[str, Any]],
+                   viewer: Optional[str], token: Optional[str]) -> List[Dict[str, Any]]:
+    """3.0.83: plural sign-offs posted on the other pulls of prtriage's grouped ask or reminder,
+    found by following the pull numbers prtriage's own ask and pointer comments name."""
+    seen, todo, out = {num}, sorted(_group_refs(comments, viewer)), []
+    while todo and len(seen) < _GROUP_MAX:
+        n = todo.pop(0)
+        if n in seen:
+            continue
+        seen.add(n)
+        theirs = _get_all(f"{_API}/{owner}/{repo}/issues/{n}/comments", token) or []
+        todo.extend(sorted(_group_refs(theirs, viewer) - seen))
+        out += [dict(c, _how=f"sign-off on #{n} covering this pull") for c in theirs
+                if signs_off_group(c.get("body"))]
+    return out
 
 
 def _state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[str, Any]:
@@ -378,7 +471,7 @@ def held(st: Dict[str, Any]) -> bool:
     """True when the pull must not forward: AI-resolved (or unreadable) and not signed off."""
     if st.get("ai") is False:
         return False
-    return not (st.get("readable") and st.get("signer"))
+    return not (st.get("readable") and st.get("signer") and st.get("label_fresh"))
 
 
 def forward_gate(token: Optional[str]) -> Callable[[Dict[str, Any]], bool]:
@@ -475,7 +568,7 @@ def classify(records: List[Dict[str, Any]], token: Optional[str],
              replaced: Optional[Dict[str, str]] = None) -> Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]]:
     from . import comments
     out: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]] = {
-        "ask": [], "release": [], "rehold": [], "waiting": [], "unreadable": [],
+        "ask": [], "release": [], "refresh": [], "rehold": [], "waiting": [], "unreadable": [],
         "remind": [], "overdue": [], "landed": [], "replaced": [], "replied": []}
     seen: set = set()
     for r in records:
@@ -494,6 +587,8 @@ def classify(records: List[Dict[str, Any]], token: Optional[str],
         elif st.get("signer"):
             if not st.get("signed_label"):
                 out["release"].append(row)
+            elif not st.get("label_fresh"):
+                out["refresh"].append(row)
         elif st.get("signed_label"):
             out["rehold"].append(row)
         elif _landed(r):
@@ -551,6 +646,11 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
         login, how, _at = st["signer"]
         print(f"    ✅ #{num}  signed off by @{login} ({how}); would add "
               f"`{config.AI_CONFLICT_SIGNOFF_LABEL}`")
+    for _o, _r, num, st in c["refresh"]:
+        login, how, _at = st["signer"]
+        print(f"    🔄 #{num}  signed off again by @{login} ({how}) after the last push; would "
+              f"re-add `{config.AI_CONFLICT_SIGNOFF_LABEL}` so the forward script sees a sign-off newer than "
+              f"the head")
     for _o, _r, num, st in c["rehold"]:
         why = (f"pushed to after @{st['stale'][0]}'s sign-off" if st.get("stale")
                else "label added without a sign-off prtriage can verify")
@@ -580,12 +680,13 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     if c["unreadable"]:
         print("    ⚠️  couldn't read the sign-off state, held: "
               + ", ".join(f"#{n}" for _o, _r, n, _s in c["unreadable"]))
-    writes = c["release"] + c["rehold"] + c["ask"] + c["remind"]
+    writes = c["release"] + c["refresh"] + c["rehold"] + c["ask"] + c["remind"]
     if not writes:
         return
     do = apply
     if not apply and interactive:
-        ans = prompt(f"\n   Apply AI-review changes ({len(c['release'])} release, "
+        ans = prompt(f"\n   Apply AI-review changes ({len(c['release']) + len(c['refresh'])} "
+                     f"release, "
                      f"{len(c['ask'])} ask, {len(c['remind'])} remind, "
                      f"{len(c['rehold'])} re-hold)? [y/N] ")
         do = (ans or "").strip().lower() in ("y", "yes")
@@ -597,7 +698,17 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
         lab = comments.add_pr_labels(o, r, num, [config.AI_CONFLICT_SIGNOFF_LABEL], token)
         ok = lab.get("ok") and github_writes._comment(
             token, full(o, r), num, f"{_SIGNED_MARKER}\n{signed_text(st['signer'])}")
+        if ok:
+            st.update(signed_label=True, label_fresh=True)
         print(f"    ✅ #{num}  " + ("released" if ok else f"release incomplete ({lab})"))
+    for o, r, num, st in c["refresh"]:
+        comments.remove_pr_label(o, r, num, config.AI_CONFLICT_SIGNOFF_LABEL, token)
+        lab = comments.add_pr_labels(o, r, num, [config.AI_CONFLICT_SIGNOFF_LABEL], token)
+        ok = lab.get("ok") and github_writes._comment(
+            token, full(o, r), num, f"{_SIGNED_MARKER}\n{signed_text(st['signer'])}")
+        if ok:
+            st["label_fresh"] = True
+        print(f"    🔄 #{num}  " + ("released again" if ok else f"release incomplete ({lab})"))
     for o, r, num, st in c["rehold"]:
         rm = comments.remove_pr_label(o, r, num, config.AI_CONFLICT_SIGNOFF_LABEL, token)
         ok = github_writes._comment(token, full(o, r), num, f"{_REHOLD_MARKER}\n{rehold_text(st)}")

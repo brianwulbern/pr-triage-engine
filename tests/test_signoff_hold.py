@@ -138,9 +138,12 @@ class PullState(unittest.TestCase):
         self.assertIn("@alice", A.ask_text(st))
         self.assertNotIn(chr(0x2014), A.ask_text(st))
 
-    def test_signed_off_is_released(self):
+    def test_signed_off_is_released_once_the_label_is_added(self):
         st = self._state(_pull([config.AI_CONFLICT_LABEL]),
                          reviews=[_rev("bob", "APPROVED", AFTER)])
+        self.assertTrue(A.held(st))           # 3.0.77: the forward script refuses until prtriage adds the label
+        st = self._state(_pull([config.AI_CONFLICT_LABEL, config.AI_CONFLICT_SIGNOFF_LABEL]),
+                         reviews=[_rev("bob", "APPROVED", AFTER)], events=[_lab("me", LATER)])
         self.assertFalse(A.held(st))
 
     def test_unreadable_pull_is_held(self):

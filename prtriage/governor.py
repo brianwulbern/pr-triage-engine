@@ -70,6 +70,15 @@ ISOLATED_RESOURCES = frozenset({"search", "code_search"})
 RESOURCE_DEFAULT_COOLDOWN = 60.0   # when the response carries no usable reset time
 RESOURCE_MAX_COOLDOWN = 65.0       # search buckets reset per minute; never sit out longer
 
+# 3.0.80 - the hourly quota. A 403 with remaining=0 on the core (or graphql) bucket isn't
+# burst pressure: nothing lifts it before X-RateLimit-Reset. The 10-28 night board read 16 of
+# them as a hot secondary limit, tripped the breaker and left 9 pulls as errors. Instead every
+# call waits for the reset, and a clean response that leaves QUOTA_RESERVE or fewer requests
+# starts the wait early, so the in-flight workers don't spend the last of it.
+QUOTA_RESERVE = 100
+QUOTA_MARGIN = 5.0
+QUOTA_MAX_WAIT = 3700.0
+
 
 class GovernorTripped(Exception):
     """Raised by pace() when the secondary rate limit has been persistently hot (>=
@@ -133,6 +142,29 @@ def _reset_in_seconds(headers: Optional[Dict[str, Any]]) -> Optional[float]:
         return None
 
 
+def _quota_left(headers: Optional[Dict[str, Any]]) -> Optional[int]:
+    """X-RateLimit-Remaining for a non-isolated bucket, else None."""
+    if not headers or _isolated_resource(headers):
+        return None
+    try:
+        left = headers.get("X-RateLimit-Remaining")
+        return None if left is None else int(left)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _quota_reserve() -> int:
+    try:
+        return max(0, int(os.environ.get("PRTRIAGE_GH_QUOTA_RESERVE", QUOTA_RESERVE)))
+    except ValueError:
+        return QUOTA_RESERVE
+
+
+def _announce(text: str) -> None:
+    import sys
+    print(text, file=sys.stderr, flush=True)
+
+
 class GitHubGovernor:
     def __init__(
         self,
@@ -161,6 +193,9 @@ class GitHubGovernor:
         # 2.238.0: per-bucket cooldowns for ISOLATED_RESOURCES (monotonic ts it lifts) + hits.
         self._resource_until: Dict[str, float] = {}
         self._resource_hits: Dict[str, int] = {}
+        self._quota_until = 0.0
+        self._quota_waits = 0
+        self._announce: Callable[[str], None] = _announce
 
     # -- pacing -------------------------------------------------------------
     def pace(self) -> float:
@@ -193,7 +228,7 @@ class GitHubGovernor:
                 self._tripped_until = 0.0
                 self._consecutive_hits = 0
             # Honor an active cooldown in full; that's a legitimate backoff.
-            floor = max(now, self._cooldown_until)
+            floor = max(now, self._cooldown_until, self._quota_until)
             # Queue behind prior reservations, but never let the spacing queue run more
             # than MAX_SPACING beyond the floor - this is what bounds the pile-up.
             start = min(max(floor, self._next_allowed), floor + MAX_SPACING)
@@ -213,15 +248,21 @@ class GitHubGovernor:
         status, headers = _resp_parts(resp)
         if status is None:
             return
+        left = _quota_left(headers)
         if _is_rate_limited(status, headers):
             # 2.238.0: an isolated bucket (code search) cools ONLY itself - no global backoff.
             res = _isolated_resource(headers)
             if res:
                 self.note_resource_limit(res, headers)
+            elif left == 0 and _reset_in_seconds(headers) is not None:
+                self.note_quota_exhausted(_reset_in_seconds(headers), left)
             else:
                 self.note_rate_limit(_retry_after_seconds(headers))
         elif 200 <= status < 400:
             self._note_clean()
+            if (left is not None and left <= _quota_reserve()
+                    and _reset_in_seconds(headers) is not None):
+                self.note_quota_exhausted(_reset_in_seconds(headers), left)
         # 4xx/5xx that aren't throttling: neither reward nor punish (don't narrow on a
         # 404, don't back off on a 500 - those aren't rate signals).
 
@@ -253,6 +294,27 @@ class GitHubGovernor:
             if self._spacing > self._baseline and self._clean_streak % RECOVER_EVERY == 0:
                 self._spacing = max(self._baseline, self._spacing - RECOVER_STEP)
 
+    def note_quota_exhausted(self, reset_in: Optional[float], left: Optional[int] = 0) -> None:
+        """3.0.80: hold every call until the hourly quota resets. Not a secondary-limit hit:
+        the spacing, the breaker streak and the hit count are left alone."""
+        wait = min(QUOTA_MAX_WAIT, max(0.0, reset_in or 0.0) + QUOTA_MARGIN)
+        with self._lock:
+            until = self._clock() + wait
+            new = until > self._quota_until + QUOTA_MARGIN
+            self._quota_until = max(self._quota_until, until)
+            if new:
+                self._quota_waits += 1
+        if new:
+            at = datetime.fromtimestamp(time.time() + wait).strftime("%H:%M")
+            self._announce(f"⏸  GitHub API quota is down to {left} request(s) this hour; "
+                           f"pausing GitHub calls {round(wait / 60)} min, until the reset at "
+                           f"{at}")
+
+    def quota_waiting(self) -> float:
+        """Seconds left on the hourly-quota wait (0.0 when there is none)."""
+        with self._lock:
+            return max(0.0, self._quota_until - self._clock())
+
     def note_resource_limit(self, resource: str,
                             headers: Optional[Dict[str, Any]] = None) -> None:
         """2.238.0: an ISOLATED bucket ran dry. Cool that bucket alone until its
@@ -282,7 +344,8 @@ class GitHubGovernor:
             return {
                 "spacing": round(self._spacing, 3),
                 "baseline": self._baseline,
-                "throttled": self._spacing > self._baseline or cooling > 0,
+                "throttled": (self._spacing > self._baseline or cooling > 0
+                              or self._quota_until > now),
                 "cooldown_remaining": round(cooling, 2),
                 "clean_streak": self._clean_streak,
                 "rate_limit_hits": self._rate_limit_hits,
@@ -292,6 +355,8 @@ class GitHubGovernor:
                 "resource_cooling": {r: round(u - now, 1)
                                      for r, u in self._resource_until.items() if u > now},
                 "resource_hits": dict(self._resource_hits),
+                "quota_waiting": round(max(0.0, self._quota_until - now), 1),
+                "quota_waits": self._quota_waits,
             }
 
     def describe(self) -> str:
@@ -304,6 +369,8 @@ class GitHubGovernor:
         if s["cooldown_remaining"] > 0:
             bits.append(f"cooling {s['cooldown_remaining']}s")
         bits.append(f"{s['rate_limit_hits']} rate-limit hit(s)")
+        if s["quota_waiting"] > 0:
+            bits.append(f"waiting {round(s['quota_waiting'] / 60)} min for the hourly quota")
         if s.get("tripped"):
             bits.append("⛔ circuit breaker OPEN (failing fast)")
         return "🐢 GitHub governor throttling - " + ", ".join(bits)
@@ -321,6 +388,8 @@ class GitHubGovernor:
             self._tripped_until = 0.0
             self._resource_until.clear()
             self._resource_hits.clear()
+            self._quota_until = 0.0
+            self._quota_waits = 0
 
 
 def _resp_parts(resp: Any):
@@ -475,7 +544,8 @@ def secondary_log_path() -> Optional[str]:
     override = os.environ.get(_SECONDARY_LOG_ENV)
     if override:
         return override
-    return os.path.join(os.path.expanduser("~"), ".cache", "prtriage", "secondary-limit.jsonl")
+    from . import config as _config
+    return os.path.join(_config.cache_root(), "prtriage", "secondary-limit.jsonl")
 
 
 def _throttle_record(resp: Any, status: Any, headers: Any) -> Dict[str, Any]:
