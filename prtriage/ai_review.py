@@ -71,8 +71,28 @@ def is_lgtm(body: Optional[str]) -> bool:
     if _LGTM_RE.match(text):
         return True
     m = _FIRST_SENTENCE_RE.match(text)
-    return bool(m and _LGTM_RE.match(m.group(1))
-                and not _HEDGE_RE.search(re.sub(r"`[^`]*`", "", m.group(2))))
+    if m and _LGTM_RE.match(m.group(1)) and not _HEDGE_RE.search(_plain(m.group(2))):
+        return True
+    return _closing_lgtm(text)
+
+
+_THANKS_RE = re.compile(r"^(?:thanks|thank you|ty)\b", re.IGNORECASE)
+_REQUEST_RE = re.compile(
+    r"\?|\b(?:please|must|should|needs?\s+to|once|until|unless|wait|pending|"
+    r"before\s+(?:merging|landing|forwarding))\b", re.IGNORECASE)
+
+
+def _closing_lgtm(text: str) -> bool:
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    while len(paras) > 1 and _THANKS_RE.match(paras[-1]):
+        paras.pop()
+    if len(paras) < 2 or not _LGTM_RE.match(paras[-1]):
+        return False
+    return not _REQUEST_RE.search(_plain("\n".join(paras)))
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"<?https?://\S+", "", re.sub(r"`[^`]*`", "", text))
 
 
 # 3.0.69: a sentence that signs off the resolution by name counts wherever it sits in the
@@ -91,7 +111,7 @@ def signs_off_resolution(body: Optional[str]) -> bool:
         return True
     if not body or body.lstrip().startswith("<!-- prtriage-"):
         return False
-    text = re.sub(r"`[^`]*`", "", body)
+    text = _plain(body)
     return any(_RESOLUTION_LGTM_RE.search(s) and not _SENTENCE_HEDGE_RE.search(s)
                for s in re.findall(r"[^.!?\n]+[.!?]?", text))
 
@@ -116,7 +136,7 @@ _CHECKED_MAX = 200
 def _checked(body: Optional[str]) -> Optional[str]:
     if not body or body.lstrip().startswith("<!-- prtriage-"):
         return None
-    text = re.sub(r"@[\w-]+", "", re.sub(r"`[^`]*`", "", body))
+    text = re.sub(r"@[\w-]+", "", _plain(body))
     text = " ".join("".join(ch for ch in text if ord(ch) < 0x2000).split()).strip(" ,:")
     m = _CHECKED_RE.match(text)
     if not m or len(text) > _CHECKED_MAX or _HEDGE_RE.search(text) or _PROBLEM_RE.search(text):
@@ -375,7 +395,8 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
     st: Dict[str, Any] = {
         "ai": True, "readable": False, "signer": None, "stale": None, "authors": [],
         "noticed": False, "base": (pull.get("base") or {}).get("ref") or "",
-        "signed_label": config.AI_CONFLICT_SIGNOFF_LABEL in labels}
+        "signed_label": config.AI_CONFLICT_SIGNOFF_LABEL in labels,
+        "open": pull.get("state", "open") == "open", "pointer": None}
     viewer = comments._viewer_login(token)
     sha = (pull.get("head") or {}).get("sha")
     commit = _get(f"{_API}/{owner}/{repo}/commits/{sha}", token) if sha else None
@@ -407,6 +428,17 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
     reminders = [c.get("created_at") or "" for c in comments if ours(c, _REMIND_MARKER)]
     st["asked_at"] = min([a for a in asks if a], default="")
     st["reminded_at"] = max([a for a in reminders if a], default="")
+    mine = sorted((c for c in comments if ours(c, _MARKER) or ours(c, _REMIND_MARKER)),
+                  key=lambda c: c.get("created_at") or "")
+    if mine:
+        last = mine[-1].get("created_at") or ""
+        tags = {f"@{a.lower()}" for a in st["authors"]}
+        followed = any(((c.get("user") or {}).get("login") or "").lower() == viewer.lower()
+                       and (c.get("created_at") or "") > last
+                       and any(t in (c.get("body") or "").lower() for t in tags)
+                       for c in comments)
+        m = _POINTER_RE.search(mine[-1].get("body") or "")
+        st["pointer"] = m.group(1) if m and not followed else None
     st["replied"] = author_reply(comments, reviews, st["authors"], st["asked_at"])
     st["requests"] = review_requests(pull, events, reviews, st["authors"])
     requested = [at for at in (st["requests"].get("asked") or {}).values() if at]
@@ -513,6 +545,21 @@ def group_text(others: List[str]) -> str:
             f"pass can cover them all.") if others else ""
 
 
+_POINTER_RE = re.compile(r"\b(?:Asked|Reminded) .+? on #(\d+) for this pull too")
+
+
+def sibling_text(st: Dict[str, Any]) -> str:
+    sib, login = st["sibling"]
+    who = _mentions(st.get("authors") or [])
+    lead = f"{who} #{sib}" if who else f"#{sib}"
+    base = f" on `{st['base']}`" if st.get("base") else ""
+    return (f"{lead} carried this request too, and it is closed now: `{login}` approved its "
+            f"conflict resolution there. This pull has its own resolution{base}, so it is "
+            f"still held. Since #{sib}'s resolution was approved, this one likely holds up as "
+            f"well; please check the resolved files here, then approve the pull or comment "
+            f"`LGTM`.")
+
+
 def pointer_text(first: str, kind: str = "asked", st: Optional[Dict[str, Any]] = None) -> str:
     who = config.PLATFORM_TEAM_AI_REVIEWER if (st or {}).get("team") else "the authors"
     return (f"{'Reminded' if kind == 'remind' else 'Asked'} {who} on #{first} for this "
@@ -569,7 +616,8 @@ def classify(records: List[Dict[str, Any]], token: Optional[str],
     from . import comments
     out: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]] = {
         "ask": [], "release": [], "refresh": [], "rehold": [], "waiting": [], "unreadable": [],
-        "remind": [], "overdue": [], "landed": [], "replaced": [], "replied": []}
+        "remind": [], "overdue": [], "landed": [], "replaced": [], "replied": [],
+        "sibling": []}
     seen: set = set()
     for r in records:
         target = ((r.get("_audit") or {}).get("target") or "").strip()
@@ -599,11 +647,24 @@ def classify(records: List[Dict[str, Any]], token: Optional[str],
             out["ask"].append(row)
         elif st.get("replied"):
             out["replied"].append(row)
+        elif _sibling_done(owner, repo, st, token):
+            out["sibling"].append(row)
         elif _due(st.get("reminded_at") or st.get("asked_at"), now):
             out["overdue" if st.get("reminded_at") else "remind"].append(row)
         else:
             out["waiting"].append(row)
     return out
+
+
+def _sibling_done(owner: str, repo: str, st: Dict[str, Any], token: Optional[str]) -> bool:
+    sib = st.get("pointer")
+    if not sib:
+        return False
+    s = _state(owner, repo, sib, token)
+    if not (s.get("ai") and s.get("readable") and s.get("open") is False and s.get("signer")):
+        return False
+    st["sibling"] = (sib, s["signer"][0])
+    return True
 
 
 def _landed(record: Dict[str, Any]) -> bool:
@@ -663,6 +724,10 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     for _o, _r, num, st in c["remind"]:
         print(f"    🔔 #{num}  no sign-off since {st['asked_at'][:10]}; would remind "
               f"{_mentions(st.get('authors') or []) or 'the authors'}")
+    for _o, _r, num, st in c["sibling"]:
+        sib, login = st["sibling"]
+        print(f"    ↪ #{num}  #{sib} (same request) is closed with @{login}'s sign-off; would "
+              f"ask {_mentions(st.get('authors') or []) or 'the authors'} here")
     for _o, _r, num, st in c["waiting"]:
         print(f"    ⏸  #{num}  awaiting sign-off: {waiting_text(st)}")
     for _o, _r, num, st in c["overdue"]:
@@ -680,14 +745,14 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     if c["unreadable"]:
         print("    ⚠️  couldn't read the sign-off state, held: "
               + ", ".join(f"#{n}" for _o, _r, n, _s in c["unreadable"]))
-    writes = c["release"] + c["refresh"] + c["rehold"] + c["ask"] + c["remind"]
+    writes = c["release"] + c["refresh"] + c["rehold"] + c["ask"] + c["remind"] + c["sibling"]
     if not writes:
         return
     do = apply
     if not apply and interactive:
         ans = prompt(f"\n   Apply AI-review changes ({len(c['release']) + len(c['refresh'])} "
                      f"release, "
-                     f"{len(c['ask'])} ask, {len(c['remind'])} remind, "
+                     f"{len(c['ask'])} ask, {len(c['remind']) + len(c['sibling'])} remind, "
                      f"{len(c['rehold'])} re-hold)? [y/N] ")
         do = (ans or "").strip().lower() in ("y", "yes")
     if not do:
@@ -714,12 +779,13 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
         ok = github_writes._comment(token, full(o, r), num, f"{_REHOLD_MARKER}\n{rehold_text(st)}")
         print(f"    ↩ #{num}  " + ("held again" if ok else f"re-hold incomplete ({rm})"))
     for kind, marker, text in (("ask", _MARKER, ask_text), ("remind", _REMIND_MARKER,
-                                                                remind_text)):
+                                                                remind_text),
+                               ("sibling", _REMIND_MARKER, sibling_text)):
         for rows in by_authors(c[kind]):
             first = rows[0][2]
             for i, (o, r, num, st) in enumerate(rows):
                 body = (text(st) + group_text([x[2] for x in rows[1:]]) if i == 0
-                        else pointer_text(first, kind, st))
+                        else pointer_text(first, "remind" if kind == "sibling" else kind, st))
                 ok = github_writes._comment(token, full(o, r), num, f"{marker}\n{body}")
                 verb = "asked" if kind == "ask" else "reminded"
                 print(f"    {'→' if kind == 'ask' else '🔔'} #{num}  "
