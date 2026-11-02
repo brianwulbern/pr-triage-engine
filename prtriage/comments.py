@@ -285,12 +285,14 @@ def _pr_head(owner: str, repo: str, number: str, headers: dict,
 
 
 def _thread_offered_fixes(owner: str, repo: str, number: str, headers: dict,
-                          timeout: int, thread: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                          timeout: int, thread: List[Dict[str, Any]],
+                          viewer: str = "") -> List[Dict[str, Any]]:
     """Fixes offered in human comments that the PR hasn't picked up: newer than the PR head
     commit (no commit has landed since the offer), and not the head itself. If the head can't
     be read, fall back to offers newer than prtriage's latest verdict comment. The head is only
     fetched when some human comment actually looks like an offer (the common PR pays nothing)."""
-    humans = [c for c in thread if not c.get("prtriage") and _is_human_login(c.get("login") or "")]
+    humans = [c for c in thread if not c.get("prtriage") and _is_human_login(c.get("login") or "")
+              and not (viewer and (c.get("login") or "").lower() == viewer.lower())]
     offers = [(c, f) for c in humans for f in _comment_fix_offers(c)]
     if not offers:
         return []
@@ -400,7 +402,8 @@ def preview_pr_verdict_action(
         return {"action": "unknown",
                 "reason": f"couldn't read existing comments ({exc}); a real post would skip"}
     # 2.239.0: compose exactly what the apply would post (leading with any offered fix).
-    fixes = _thread_offered_fixes(owner, repo, number, headers, timeout, thread)
+    fixes = _thread_offered_fixes(owner, repo, number, headers, timeout, thread,
+                                  _viewer_login(token))
     composed = _compose_post_body(verdict_md, fixes)
     if prev is None:
         return {"action": "create", "url": "", "body": composed, "fixes": fixes}
@@ -513,7 +516,8 @@ def upsert_pr_verdict_comment(
                and _refresh_enabled())
     # 2.239.0 (#1234): lead with any fix offered in the thread, and don't post a fresh
     # copy when nothing but volatile numbers changed (edit the latest in place instead).
-    fixes = _thread_offered_fixes(owner, repo, number, headers, timeout, thread)
+    fixes = _thread_offered_fixes(owner, repo, number, headers, timeout, thread,
+                                  _viewer_login(token))
     composed = _compose_post_body(verdict_md, fixes)
     body = f"{_VERDICT_MARKER}\n{composed}"
     if refresh and _post_substance(prev[1]) == _post_substance(composed):
