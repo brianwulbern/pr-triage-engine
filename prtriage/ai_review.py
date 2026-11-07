@@ -12,7 +12,9 @@ such pull forwards until a person has checked the resolution:
 * sign-off is a GitHub Approve review or an `LGTM` comment, or the `ai-resolution-signed-off`
   label added by hand, from a member of the repository's GitHub org (`product`). Never the bot that
   opened the pull and never the person forwarding it (the token owner), so a second person
-  always looks at the model's work. 3.0.62: an opener who also wrote the commits can sign;
+  always looks at the model's work. 3.0.62: an opener who also wrote the commits can sign.
+  3.0.97: the shared `product-release` account can sign (config.AI_SIGNOFF_SHARED_LOGINS);
+  other bots still can't;
 * only a sign-off newer than the pull's head commit counts: a push after it holds the pull again;
 * a later "Request changes" review undoes an earlier sign-off.
 
@@ -27,7 +29,7 @@ import logging
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from . import config
+from . import config, double_agent
 
 log = logging.getLogger(__name__)
 
@@ -199,7 +201,9 @@ def find_signer(reviews: List[Dict[str, Any]], comments: List[Dict[str, Any]],
     for at, login, how, utype in sorted(cands, reverse=True):
         if not at or at <= head_at or at <= block_at:
             continue
-        if _is_bot(login, utype) or login.lower() in excluded:
+        if login.lower() in excluded:
+            continue
+        if _is_bot(login, utype) and login.lower() not in config.AI_SIGNOFF_SHARED_LOGINS:
             continue
         if not is_member(login):
             continue
@@ -406,6 +410,8 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
     events = _get_all(f"{_API}/{owner}/{repo}/issues/{num}/events", token)
     commits = _get_all(f"{_API}/{owner}/{repo}/pulls/{num}/commits", token) or []
     st["authors"] = human_authors(commits, viewer)
+    st.update(head=sha or "", title=pull.get("title") or "", body=pull.get("body") or "",
+              commits=commits, compile_label=config.AI_COMPILE_FAILURE_LABEL in labels)
     files = _get_all(f"{_API}/{owner}/{repo}/pulls/{num}/files", token)
     paths = None if files is None else [f.get("filename") or "" for f in files]
     rules = _codeowners(owner, repo, token) if paths is not None else None
@@ -424,6 +430,7 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
             not core or config.PLATFORM_TEAM_AI_REVIEWER.lower() in body.lower())
 
     st["noticed"] = any(ours(c, _MARKER) for c in comments)
+    st["da_heads"] = double_agent.posted_heads(comments, viewer)
     asks = [c.get("created_at") or "" for c in comments if ours(c, _MARKER)]
     reminders = [c.get("created_at") or "" for c in comments if ours(c, _REMIND_MARKER)]
     st["asked_at"] = min([a for a in asks if a], default="")
@@ -745,15 +752,17 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     if c["unreadable"]:
         print("    ⚠️  couldn't read the sign-off state, held: "
               + ", ".join(f"#{n}" for _o, _r, n, _s in c["unreadable"]))
+    reviews = double_agent_step(c, token)
     writes = c["release"] + c["refresh"] + c["rehold"] + c["ask"] + c["remind"] + c["sibling"]
-    if not writes:
+    if not writes and not reviews:
         return
     do = apply
     if not apply and interactive:
         ans = prompt(f"\n   Apply AI-review changes ({len(c['release']) + len(c['refresh'])} "
                      f"release, "
                      f"{len(c['ask'])} ask, {len(c['remind']) + len(c['sibling'])} remind, "
-                     f"{len(c['rehold'])} re-hold)? [y/N] ")
+                     f"{len(c['rehold'])} re-hold, {len(reviews)} double-agent review)? "
+                     f"[y/N] ")
         do = (ans or "").strip().lower() in ("y", "yes")
     if not do:
         print("   (dry-run - nothing changed; --apply or answer y to act)")
@@ -791,6 +800,54 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
                 print(f"    {'→' if kind == 'ask' else '🔔'} #{num}  "
                       + ((verb if i == 0 else f"{verb} (pointer to #{first})") if ok
                          else "couldn't post; ask by hand"))
+    for o, r, num, st, rec in reviews:
+        ok = github_writes._comment(token, full(o, r), num,
+                                  double_agent.comment_text(rec))
+        if ok:
+            double_agent.ledger(rec, bool(st.get("compile_label")))
+            st.setdefault("da_heads", set()).add(rec["head"])
+        print(f"    🕵 #{num}  " + ("double-agent review posted" if ok
+                                   else "couldn't post the double-agent review"))
+
+
+_DA_KINDS = ("ask", "remind", "sibling", "waiting", "overdue", "replied", "rehold")
+
+
+def double_agent_step(c: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]],
+                      token: Optional[str]) -> List[Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]]:
+    """3.1.0: two models review each held resolution once per head (double_agent.py); the
+    verdicts print on every board and post on --apply. Never touches the hold."""
+    import concurrent.futures as cf
+    from . import local_clone as rfc
+    root = rfc.portal_root()
+    if not (root and double_agent.enabled()):
+        return []
+    rows = [row for k in _DA_KINDS for row in c[k]
+            if row[3].get("head") and row[3].get("open", True)
+            and row[3]["head"] not in (row[3].get("da_heads") or set())]
+    rows = sorted(rows, key=lambda x: int(x[2]))[:config.DOUBLE_AGENT_MAX_PER_BOARD]
+    if not rows:
+        return []
+
+    def one(row: Tuple[str, str, str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        o, r, num, st = row
+        if not double_agent.ensure_local(root, o, r, num, st["head"]):
+            return None
+        return double_agent.review(num, st["head"], st.get("base") or "", st.get("title") or "",
+                                   st.get("body") or "", st.get("commits") or [], root)
+
+    with cf.ThreadPoolExecutor(config.DOUBLE_AGENT_CONCURRENCY) as ex:
+        got = list(ex.map(one, rows))
+    out = []
+    for row, rec in zip(rows, got):
+        if not rec:
+            print(f"    🕵 #{row[2]}  double agent: no review (no backport-bot section matched, or a "
+                  f"model gave no answer)")
+            continue
+        flag = " + compile label" if row[3].get("compile_label") else ""
+        print(f"    🕵 #{row[2]}  double agent: {double_agent.summary(rec)}{flag}")
+        out.append(row + (rec,))
+    return out
 
 
 def by_authors(rows: List[Tuple[str, str, str, Dict[str, Any]]]

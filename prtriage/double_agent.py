@@ -1,0 +1,318 @@
+"""3.1.0: two models review an AI-resolved conflict, independently, to help the person who
+signs it off.
+
+A backtest on 85 bot-resolved pulls: both models flagged all four resolutions that were
+really broken, two of which a person had approved, and passed 32 of the 35 a person accepted. It is a review aid, not a sign-off: the hold in
+ai_review is unchanged, and every verdict goes to a ledger so it can be compared with the
+person's call later.
+
+Evidence per resolved file: the conflict as git leaves it (rebuilt with merge-tree, diff3),
+master's own change, and what the pull applied. Each reviewer may run read-only `git grep`,
+`git show` and `git ls-tree` against the pull head in the local portal clone."""
+import concurrent.futures as cf
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import config
+
+MARKER = "<!-- prtriage-double-agent: {sha} -->"
+PROMPT_VERSION = 2
+_MARKER_RE = re.compile(r"<!-- prtriage-double-agent: ([0-9a-f]{7,40}) -->")
+_SECTION_RE = re.compile(r"Resolved while cherry-picking\s+https://github\.com/example-org/"
+                         r"product/commit/([0-9a-f]{40})")
+_FILES_RE = re.compile(r"Resolved files:\s*\n((?:\s*\*\s*`[^`]+`\s*\n?)+)")
+_RISKS_RE = re.compile(r"Risks reported by the model:\s*\n(.*?)(?:\n\s*\n(?!\*)|\Z)", re.S)
+
+SYSTEM = ("You review merge-conflict resolutions on product backports. You may only run the "
+          "read-only git commands you are given. Your final message is one JSON object and "
+          "nothing else.")
+INSTR = """A model resolved the merge conflicts below while the backport bot cherry-picked a master commit onto a product release branch. You are one of two independent reviewers. A person may rely on your answer to decide whether the resolution is safe to forward without reading it themselves.
+
+Release branches diverge from master on purpose: they keep older APIs, their own upgrade-step and schema versions, and their own test setup. A resolution is correct when it applies the master commit's intent to the branch's code and keeps the branch's own code working. It does not have to equal master. Leaving master code out is fine when the branch doesn't need or can't take it; extra adaptation is fine when the branch needs it.
+
+Raise a concern only for something that would make the backport wrong on this branch:
+- the master change's intent is lost or only partly applied;
+- branch-only code is dropped or broken;
+- the result uses a class, method, field, import, rule or signature the branch side ("ours") doesn't show it has, or calls something with arguments its branch declaration doesn't take;
+- an upgrade step, schema version, bnd version or packageinfo version doesn't follow the branch's own sequence, or reuses a version range another release line uses for a different step;
+- a test asserts behavior the branch doesn't have, or loses setup the branch's other tests rely on;
+- duplicated, unbalanced or left-over code.
+Don't raise style, naming, or "differs from master" on its own.
+
+You can read the branch with these read-only commands (nothing else is allowed):
+  git grep -n <pattern> {REF} -- <path or dir>
+  git show {REF}:<path>
+  git ls-tree -r --name-only {REF} -- <dir>
+{REF} is the pull's head on {BASE}. Commits after the pick may already have changed the resolved files; the evidence lists them, and the pull is judged at {REF}, not at the pick. When a hunk relies on a class, method, field, rule or version you can't see in the evidence, check it on {REF} before deciding. Raise a concern only for what you confirmed is wrong, or for what you still can't settle after checking (say exactly what a person must check). Use a handful of lookups, not an exhaustive audit.
+
+Return only: {"verdict": "pass" or "concern", "hunks": [{"file": "<file name>", "issue": "<what is wrong or must be checked>"}], "reason": "<one or two sentences>"}. "hunks" is empty for a pass.
+
+EVIDENCE
+"""
+
+
+def enabled() -> bool:
+    return not os.environ.get("PRTRIAGE_NO_DOUBLE_AGENT", "").strip() and bool(shutil.which("claude"))
+
+
+def _dir() -> str:
+    d = os.path.join(config.cache_root(), "prtriage", "double-agent")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def sections(body: Optional[str]) -> List[Dict[str, Any]]:
+    """The backport bot's 'Resolved while cherry-picking' sections: master commit, resolved files, the
+    resolving model's own risk notes."""
+    parts = _SECTION_RE.split(body or "")
+    out = []
+    for i in range(1, len(parts), 2):
+        txt = parts[i + 1]
+        m = _FILES_RE.search(txt)
+        risks = _RISKS_RE.search(txt)
+        out.append({"master": parts[i],
+                    "files": re.findall(r"`([^`]+)`", m.group(1)) if m else [],
+                    "risks": (risks.group(1).strip() if risks else "")[:3000]})
+    return out
+
+
+def _git(root: str, *args: str, ok: Tuple[int, ...] = (0,)) -> Optional[str]:
+    try:
+        p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True,
+                           timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return p.stdout if p.returncode in ok else None
+
+
+def _cap(text: str, n: int) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[:n]) + (f"\n... [{len(lines) - n} more lines cut]"
+                                   if len(lines) > n else "")
+
+
+def regions(text: str, ctx: int = 4) -> List[str]:
+    lines, out, i = text.splitlines(), [], 0
+    while i < len(lines):
+        if lines[i].startswith("<<<<<<<"):
+            j = i
+            while j < len(lines) and not lines[j].startswith(">>>>>>>"):
+                j += 1
+            a, b = max(0, i - ctx), min(len(lines), j + 1 + ctx)
+            out.append(f"@@ lines {a + 1}-{b} @@\n" + "\n".join(lines[a:b]))
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def match_picks(secs: List[Dict[str, Any]], commits: List[Dict[str, Any]], root: str) -> None:
+    """Each section's `pick`: the pull's product-release commit with the master commit's
+    subject."""
+    for s in secs:
+        subj = (_git(root, "log", "-1", "--format=%s", s["master"]) or "").strip()
+        for c in commits:
+            msg = ((c.get("commit") or {}).get("message") or "").split("\n")[0]
+            if subj and msg == subj and \
+                    ((c.get("committer") or {}).get("login") or "") in config.AI_SIGNOFF_SHARED_LOGINS:
+                s["pick"] = c.get("sha")
+                break
+
+
+def bundle(num: str, base: str, title: str, secs: List[Dict[str, Any]], root: str,
+           commits: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """The evidence both reviewers read, or None when no section matched a pick."""
+    parts = [f"Pull #{num} on {base}: {title}"]
+    if not any(s.get("pick") for s in secs):
+        return None
+    for s in secs:
+        pick, m = s.get("pick"), s["master"]
+        if not pick:
+            parts.append(f"\n## master commit {m[:12]}: backport-bot commit not found in the pull; "
+                         f"skipped")
+            continue
+        subj = (_git(root, "log", "-1", "--format=%s", m) or "").strip()
+        out = _git(root, "-c", "merge.conflictStyle=diff3", "merge-tree", "--write-tree",
+                   "--name-only", f"--merge-base={m}^", f"{pick}^", m, ok=(0, 1)) or ""
+        tree = out.split("\n", 1)[0].strip()
+        parts.append(f"\n## Cherry-pick of master commit {m[:12]} \"{subj}\" onto {base}")
+        if s.get("risks"):
+            parts.append("Notes the resolving model left in the pull body (they may be "
+                         "wrong):\n" + _cap(s["risks"], 30))
+        for f in s["files"]:
+            regs = regions((_git(root, "show", f"{tree}:{f}") if tree else None) or "")
+            mdiff = _git(root, "diff", f"{m}^", m, "--", f) or ""
+            applied = _git(root, "diff", f"{pick}^", pick, "--", f) or ""
+            parts.append(f"\n### File {f}")
+            parts.append(f"#### Conflict as git left it (diff3: ours = {base} before the pick, "
+                         f"base = master's parent, theirs = master), {len(regs)} region(s)\n"
+                         + (_cap("\n\n".join(regs), 220) if regs
+                            else "(no textual conflict markers rebuilt for this file)"))
+            parts.append("#### Master's own change to this file\n" + (_cap(mdiff, 160) or "(none)"))
+            parts.append(f"#### What the pull applied to {base} for this file (the resolution)\n"
+                         + (_cap(applied, 220)
+                            or "(no change: the file was left as the branch had it)"))
+    later = later_commits(secs, commits, root)
+    if later:
+        parts.append("\n## Later commits on the pull that change the resolved files (the pull "
+                     "head includes them)")
+        for sha, subj, files in later:
+            diff = _git(root, "diff", f"{sha}^", sha, "--", *files) or ""
+            parts.append(f"\n### {sha[:12]} \"{subj}\"\n" + _cap(diff, 160))
+    return "\n".join(parts)
+
+
+def later_commits(secs: List[Dict[str, Any]], commits: List[Dict[str, Any]], root: str
+                  ) -> List[Tuple[str, str, List[str]]]:
+    """3.1.1: commits after the first pick that change a resolved file. A
+    reviewer shown only the pick read a test the pull had already fixed as broken."""
+    picks = {s.get("pick") for s in secs if s.get("pick")}
+    resolved = {f for s in secs for f in s["files"]}
+    shas = [c.get("sha") or "" for c in commits]
+    first = min((shas.index(p) for p in picks if p in shas), default=None)
+    if first is None:
+        return []
+    out = []
+    for sha, c in zip(shas[first + 1:], commits[first + 1:]):
+        if sha in picks:
+            continue
+        names = (_git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", sha) or "").split()
+        hit = [n for n in names if n in resolved]
+        if hit:
+            subj = ((c.get("commit") or {}).get("message") or "").split("\n")[0]
+            out.append((sha, subj, hit))
+    return out
+
+
+def ensure_local(root: str, owner: str, repo: str, num: str, head: str) -> bool:
+    """The pull head and master in the local clone, fetched when missing."""
+    from . import local_clone as rfc
+    if not rfc._master_ref(root, owner, repo):
+        return False
+    if _git(root, "cat-file", "-e", f"{head}^{{commit}}") is None:
+        remote = rfc._master_ref(root, owner, repo).split("/", 1)[0]
+        rfc._git(root, ["fetch", "-q", remote, f"pull/{num}/head"], timeout=180)
+    return _git(root, "cat-file", "-e", f"{head}^{{commit}}") is not None
+
+
+def last_json(text: str) -> Optional[Dict[str, Any]]:
+    """The last JSON object with a verdict; also one whose closing brackets were cut off
+    (three of the backtest's 170 answers)."""
+    dec = json.JSONDecoder()
+    for tail in ("", "}", "]}", "\"}", "\"}]}"):
+        best = None
+        for i, ch in enumerate(text + tail):
+            if ch != "{":
+                continue
+            try:
+                obj, _ = dec.raw_decode((text + tail)[i:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("verdict") in ("pass", "concern"):
+                best = obj
+        if best:
+            return best
+    return None
+
+
+def _ask(model: str, prompt: str, root: str) -> Dict[str, Any]:
+    tools = [f"Bash(git {c}:*)" for c in ("grep", "show", "ls-tree")]
+    try:
+        p = subprocess.run(
+            ["claude", "-p", "--output-format", "json", "--model", model, "--tools", "Bash",
+             "--allowedTools", *tools, "--strict-mcp-config", "--system-prompt", SYSTEM,
+             "--no-session-persistence"],
+            input=prompt, capture_output=True, text=True, timeout=900, cwd=root)
+        env = json.loads(p.stdout)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return {"model": model, "answer": None}
+    return {"model": model, "answer": last_json(env.get("result") or ""),
+            "cost": env.get("total_cost_usd")}
+
+
+def review(num: str, head: str, base: str, title: str, body: str,
+           commits: List[Dict[str, Any]], root: str) -> Optional[Dict[str, Any]]:
+    """Both verdicts for `num` at `head`, cached on disk per head. None when there is no
+    evidence to review or a model gave no usable answer (nothing is cached then)."""
+    path = os.path.join(_dir(), f"{num}-{head[:12]}-v{PROMPT_VERSION}.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            pass
+    secs = sections(body)
+    if not secs:
+        return None
+    match_picks(secs, commits, root)
+    ev = bundle(num, base, title, secs, root, commits)
+    if not ev:
+        return None
+    prompt = INSTR.replace("{REF}", head).replace("{BASE}", base) + ev
+    with cf.ThreadPoolExecutor(len(config.DOUBLE_AGENT_MODELS)) as ex:
+        got = list(ex.map(lambda m: _ask(m[1], prompt, root), config.DOUBLE_AGENT_MODELS))
+    if not all(g["answer"] for g in got):
+        return None
+    rec = {"pr": num, "head": head, "base": base,
+           "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+           "reviews": [dict(g, name=n) for g, (n, _m) in zip(got, config.DOUBLE_AGENT_MODELS)]}
+    with open(path, "w") as fh:
+        json.dump(rec, fh, indent=1)
+    return rec
+
+
+def both_pass(rec: Dict[str, Any]) -> bool:
+    return all((r.get("answer") or {}).get("verdict") == "pass" for r in rec["reviews"])
+
+
+def summary(rec: Dict[str, Any]) -> str:
+    v = ", ".join(f"{r['name']} {(r['answer'] or {}).get('verdict')}" for r in rec["reviews"])
+    return ("both pass" if both_pass(rec) else "concern") + f" ({v})"
+
+
+def comment_text(rec: Dict[str, Any]) -> str:
+    names = " and ".join(f"{r['name']} (`{r['model']}`)" for r in rec["reviews"])
+    out = [MARKER.format(sha=rec["head"]),
+           f"To help with the sign-off, two models reviewed this conflict resolution independently: {names}. Each "
+           f"read the conflict as git left it, master's change and what this pull applied, "
+           f"and checked the branch at {rec['head'][:10]} where it needed to."]
+    if both_pass(rec):
+        out.append("\nBoth pass:")
+        out += [f"- {r['name']}: {(r['answer'] or {}).get('reason', '').strip()}"
+                for r in rec["reviews"]]
+    else:
+        out.append("\nAt least one raised a concern worth checking before signing off:")
+        for r in rec["reviews"]:
+            a = r["answer"] or {}
+            if a.get("verdict") == "pass":
+                out.append(f"- {r['name']} passes: {a.get('reason', '').strip()}")
+                continue
+            out.append(f"- {r['name']}: {a.get('reason', '').strip()}")
+            out += [f"  - `{h.get('file', '')}`: {h.get('issue', '').strip()}"
+                    for h in a.get("hunks") or []]
+    out.append("\nThis is a review aid, not a sign-off: the pull stays held until a person "
+               "other than the forwarder approves it or comments `LGTM`.")
+    return "\n".join(out).replace("\u2014", ",")
+
+
+def posted_heads(comments: List[Dict[str, Any]], viewer: Optional[str]) -> set:
+    me = (viewer or "").lower()
+    return {m.group(1) for c in comments or []
+            if ((c.get("user") or {}).get("login") or "").lower() == me
+            for m in [_MARKER_RE.search(c.get("body") or "")] if m}
+
+
+def ledger(rec: Dict[str, Any], compile_label: bool) -> None:
+    row = {"pr": rec["pr"], "head": rec["head"], "base": rec["base"], "at": rec["at"],
+           "verdicts": {r["name"]: (r["answer"] or {}).get("verdict") for r in rec["reviews"]},
+           "both_pass": both_pass(rec), "compile_label": compile_label}
+    try:
+        with open(os.path.join(_dir(), "ledger.jsonl"), "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except OSError:
+        pass

@@ -70,6 +70,9 @@ STALE_REBASE_BEHIND_THRESHOLD = 200
 # then the sign-off label is added. One reminder after this many working days.
 AI_CONFLICT_LABEL = "ai-resolved-conflict"
 AI_CONFLICT_SIGNOFF_LABEL = "ai-resolution-signed-off"
+AI_COMPILE_FAILURE_LABEL = "ai-resolution-compile-failure"
+# A shared release account may sign off; other bots can't.
+AI_SIGNOFF_SHARED_LOGINS = frozenset({"product-release"})
 AI_REVIEW_REMIND_WORKDAYS = 2
 # A team can route these reviews to one person: a pull that changes a path CODEOWNERS gives the
 # team, or whose commit author is on it, asks only this reviewer.
@@ -77,6 +80,10 @@ PLATFORM_TEAM_CODEOWNER = "platform-core"
 PLATFORM_TEAM_MEMBERS = ("core-dev-a", "core-dev-b", "core-dev-c")
 PLATFORM_TEAM_AI_REVIEWER = "core-reviewer"
 POSTABLE_REPO_PREFIX = "example-org/"
+# The double agent: two models review each held resolution independently, once per pull head.
+DOUBLE_AGENT_MODELS = (("Fable", "claude-fable-5-1"), ("Opus", "claude-opus-5-5"))
+DOUBLE_AGENT_MAX_PER_BOARD = 30
+DOUBLE_AGENT_CONCURRENCY = 3
 
 # --- re-run reconciliation -------------------------------------------------------------------
 # How many earlier runs of the same trigger a pull's latest run is compared against.
