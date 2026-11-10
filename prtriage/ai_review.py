@@ -430,7 +430,8 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
             not core or config.PLATFORM_TEAM_AI_REVIEWER.lower() in body.lower())
 
     st["noticed"] = any(ours(c, _MARKER) for c in comments)
-    st["da_heads"] = double_agent.posted_heads(comments, viewer)
+    st["da_comments"] = double_agent.posted_comments(comments, viewer)
+    st["da_heads"] = set(st["da_comments"])
     asks = [c.get("created_at") or "" for c in comments if ours(c, _MARKER)]
     reminders = [c.get("created_at") or "" for c in comments if ours(c, _REMIND_MARKER)]
     st["asked_at"] = min([a for a in asks if a], default="")
@@ -753,15 +754,22 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
         print("    ⚠️  couldn't read the sign-off state, held: "
               + ", ".join(f"#{n}" for _o, _r, n, _s in c["unreadable"]))
     reviews = double_agent_step(c, token)
+    relayout = double_agent_relayout(c)
+    if relayout:
+        print(f"    🕵 would update {len(relayout)} double-agent comment(s) to the current layout "
+              f"(edited in place, no mentions): "
+              + ", ".join(f"#{x[2]}" for x in relayout))
+    da_recs = {num: rec for _o, _r, num, _st, rec in reviews}
     writes = c["release"] + c["refresh"] + c["rehold"] + c["ask"] + c["remind"] + c["sibling"]
-    if not writes and not reviews:
+    if not writes and not reviews and not relayout:
         return
     do = apply
     if not apply and interactive:
         ans = prompt(f"\n   Apply AI-review changes ({len(c['release']) + len(c['refresh'])} "
                      f"release, "
                      f"{len(c['ask'])} ask, {len(c['remind']) + len(c['sibling'])} remind, "
-                     f"{len(c['rehold'])} re-hold, {len(reviews)} double-agent review)? "
+                     f"{len(c['rehold'])} re-hold, {len(reviews)} double-agent review, "
+                     f"{len(relayout)} review relayout)? "
                      f"[y/N] ")
         do = (ans or "").strip().lower() in ("y", "yes")
     if not do:
@@ -795,22 +803,45 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
             for i, (o, r, num, st) in enumerate(rows):
                 body = (text(st) + group_text([x[2] for x in rows[1:]]) if i == 0
                         else pointer_text(first, "remind" if kind == "sibling" else kind, st))
+                body += double_agent.ask_line(
+                    da_recs.get(num) or double_agent.cached(num, st.get("head") or ""))
                 ok = github_writes._comment(token, full(o, r), num, f"{marker}\n{body}")
                 verb = "asked" if kind == "ask" else "reminded"
                 print(f"    {'→' if kind == 'ask' else '🔔'} #{num}  "
                       + ((verb if i == 0 else f"{verb} (pointer to #{first})") if ok
                          else "couldn't post; ask by hand"))
     for o, r, num, st, rec in reviews:
+        mention = None if double_agent.both_pass(rec) else (st.get("authors") or [])
         ok = github_writes._comment(token, full(o, r), num,
-                                  double_agent.comment_text(rec))
+                                  double_agent.comment_text(rec, mention))
         if ok:
             double_agent.ledger(rec, bool(st.get("compile_label")))
             st.setdefault("da_heads", set()).add(rec["head"])
         print(f"    🕵 #{num}  " + ("double-agent review posted" if ok
                                    else "couldn't post the double-agent review"))
+    for o, r, num, cid, rec in relayout:
+        ok = github_writes._edit_comment(token, full(o, r), cid, double_agent.comment_text(rec))
+        print(f"    🕵 #{num}  " + ("double-agent review updated to the current layout" if ok
+                                   else "couldn't update the double-agent review"))
 
 
 _DA_KINDS = ("ask", "remind", "sibling", "waiting", "overdue", "replied", "rehold")
+
+
+def double_agent_relayout(c: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]]
+                          ) -> List[Tuple[str, str, str, Any, Dict[str, Any]]]:
+    """3.1.2: the review on a held pull's current head, posted in an older layout, is edited
+    in place to the current one (no mentions, so nobody is notified again)."""
+    out = []
+    for k in _DA_KINDS:
+        for o, r, num, st in c[k]:
+            got = (st.get("da_comments") or {}).get(st.get("head") or "")
+            if not got or got[1] >= double_agent.LAYOUT:
+                continue
+            rec = double_agent.cached(num, st["head"])
+            if rec:
+                out.append((o, r, num, got[0], rec))
+    return sorted(out, key=lambda x: int(x[2]))
 
 
 def double_agent_step(c: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]],

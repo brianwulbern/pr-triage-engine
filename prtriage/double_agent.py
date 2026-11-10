@@ -20,9 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 
-MARKER = "<!-- prtriage-double-agent: {sha} -->"
+LAYOUT = 2
+MARKER = "<!-- prtriage-double-agent: {sha} v%d -->" % LAYOUT
 PROMPT_VERSION = 2
-_MARKER_RE = re.compile(r"<!-- prtriage-double-agent: ([0-9a-f]{7,40}) -->")
+_MARKER_RE = re.compile(r"<!-- prtriage-double-agent: ([0-9a-f]{7,40})(?: v(\d+))? -->")
+_SENTENCE_RE = re.compile(r"(.+?[.!?])(?:\s|$)", re.S)
 _SECTION_RE = re.compile(r"Resolved while cherry-picking\s+https://github\.com/example-org/"
                          r"product/commit/([0-9a-f]{40})")
 _FILES_RE = re.compile(r"Resolved files:\s*\n((?:\s*\*\s*`[^`]+`\s*\n?)+)")
@@ -275,36 +277,105 @@ def summary(rec: Dict[str, Any]) -> str:
     return ("both pass" if both_pass(rec) else "concern") + f" ({v})"
 
 
-def comment_text(rec: Dict[str, Any]) -> str:
-    names = " and ".join(f"{r['name']} (`{r['model']}`)" for r in rec["reviews"])
-    out = [MARKER.format(sha=rec["head"]),
-           f"To help with the sign-off, two models reviewed this conflict resolution independently: {names}. Each "
-           f"read the conflict as git left it, master's change and what this pull applied, "
-           f"and checked the branch at {rec['head'][:10]} where it needed to."]
+def cached(num: str, head: str) -> Optional[Dict[str, Any]]:
+    """The review already on disk for `num` at `head`, from this prompt version or before."""
+    for name in (f"{num}-{head[:12]}-v{PROMPT_VERSION}.json", f"{num}-{head[:12]}.json"):
+        try:
+            with open(os.path.join(_dir(), name)) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _first_sentence(text: str, cap: int = 240) -> str:
+    t = " ".join((text or "").split())
+    m = _SENTENCE_RE.match(t)
+    t = m.group(1) if m else t
+    return t if len(t) <= cap else t[:cap - 1].rstrip() + "…"
+
+
+def concerns(rec: Dict[str, Any]) -> List[Tuple[str, str, List[str]]]:
+    """(file or "", first sentence, model names): one row per flagged file, both models'
+    flags on the same file merged, the shorter sentence kept."""
+    rows: Dict[str, Tuple[str, List[str]]] = {}
+    for r in rec["reviews"]:
+        a = r.get("answer") or {}
+        if a.get("verdict") != "concern":
+            continue
+        flags = [(h.get("file") or "", h.get("issue") or "") for h in a.get("hunks") or []] \
+            or [("", a.get("reason") or "")]
+        for f, issue in flags:
+            line = _first_sentence(issue)
+            if f in rows:
+                old, names = rows[f]
+                rows[f] = (min(old, line, key=len), names + [r["name"]])
+            else:
+                rows[f] = (line, [r["name"]])
+    return [(f, line, names) for f, (line, names) in rows.items()]
+
+
+def comment_text(rec: Dict[str, Any], mention: Optional[List[str]] = None) -> str:
+    """3.1.2: the verdict first, each model's full review folded below it. `mention` pings
+    the people the sign-off ask pings, only on a concern."""
+    head = rec["head"]
+    out = [MARKER.format(sha=head)]
     if both_pass(rec):
-        out.append("\nBoth pass:")
-        out += [f"- {r['name']}: {(r['answer'] or {}).get('reason', '').strip()}"
-                for r in rec["reviews"]]
+        out.append(f"🕵 **Double-agent review: both models pass.** Fable and Opus each "
+                   f"reviewed this conflict resolution on their own and found nothing wrong "
+                   f"at {head[:10]}.")
     else:
-        out.append("\nAt least one raised a concern worth checking before signing off:")
-        for r in rec["reviews"]:
-            a = r["answer"] or {}
-            if a.get("verdict") == "pass":
-                out.append(f"- {r['name']} passes: {a.get('reason', '').strip()}")
-                continue
-            out.append(f"- {r['name']}: {a.get('reason', '').strip()}")
-            out += [f"  - `{h.get('file', '')}`: {h.get('issue', '').strip()}"
-                    for h in a.get("hunks") or []]
+        rows = concerns(rec)
+        who = " ".join(f"@{a}" for a in mention or [])
+        what = "a concern" if len(rows) == 1 else f"{len(rows)} concerns"
+        out.append(f"{who + ' ' if who else ''}🕵 **Double-agent review: {what} to check "
+                   f"before signing off.**")
+        out += [(f"- `{f.rsplit('/', 1)[-1]}`: " if f else "- ") + f"{line} "
+                f"({', '.join(names)})" for f, line, names in rows]
+    out.append("\n<details><summary>Both reviews</summary>\n")
+    for r in rec["reviews"]:
+        a = r.get("answer") or {}
+        out.append(f"**{r['name']}** (`{r['model']}`): {a.get('verdict')}. "
+                   f"{(a.get('reason') or '').strip()}")
+        out += [f"- `{h.get('file', '')}`: {(h.get('issue') or '').strip()}"
+                for h in a.get("hunks") or []]
+        out.append("")
+    out.append(f"Each model read the conflict as git left it, master's change, what this pull "
+               f"applied and any later commits on the resolved files, and checked the branch "
+               f"at {head[:10]} with read-only git lookups.\n</details>")
     out.append("\nThis is a review aid, not a sign-off: the pull stays held until a person "
                "other than the forwarder approves it or comments `LGTM`.")
     return "\n".join(out).replace("\u2014", ",")
 
 
+def ask_line(rec: Optional[Dict[str, Any]]) -> str:
+    """3.1.2: what a sign-off ask or reminder says about the review on the same pull."""
+    if not rec:
+        return ""
+    if both_pass(rec):
+        return ("\n\nTwo models also reviewed the resolution here and both pass; see the "
+                "double-agent review on this pull.")
+    return ("\n\nTwo models also reviewed the resolution here and raised a concern; see the "
+            "double-agent review on this pull before signing off.")
+
+
 def posted_heads(comments: List[Dict[str, Any]], viewer: Optional[str]) -> set:
+    return set(posted_comments(comments, viewer))
+
+
+def posted_comments(comments: List[Dict[str, Any]], viewer: Optional[str]
+                    ) -> Dict[str, Tuple[Any, int]]:
+    """{head: (comment id, layout)} for the viewer's double-agent comments; layout 1 is the
+    3.1.0 comment, which had no version in its marker."""
     me = (viewer or "").lower()
-    return {m.group(1) for c in comments or []
-            if ((c.get("user") or {}).get("login") or "").lower() == me
-            for m in [_MARKER_RE.search(c.get("body") or "")] if m}
+    out: Dict[str, Tuple[Any, int]] = {}
+    for c in comments or []:
+        if ((c.get("user") or {}).get("login") or "").lower() != me:
+            continue
+        m = _MARKER_RE.search(c.get("body") or "")
+        if m:
+            out[m.group(1)] = (c.get("id"), int(m.group(2) or 1))
+    return out
 
 
 def ledger(rec: Dict[str, Any], compile_label: bool) -> None:

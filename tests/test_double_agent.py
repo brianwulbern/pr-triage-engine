@@ -65,26 +65,56 @@ class Later(unittest.TestCase):
 
 
 class Text(unittest.TestCase):
+    """3.1.2: the verdict first, both reviews folded below."""
+
     def test_both_pass(self):
         t = D.comment_text(_rec(PASS, PASS))
         self.assertTrue(t.startswith(D.MARKER.format(sha="c" * 40)))
-        self.assertIn("Both pass", t)
+        self.assertIn("**Double-agent review: both models pass.**", t.split("\n")[1])
+        self.assertIn("<details><summary>Both reviews</summary>", t)
         self.assertIn("not a sign-off", t)
         self.assertNotIn("\u2014", t)
         self.assertNotIn("@", t)
 
-    def test_a_concern_names_the_file_and_the_issue(self):
+    def test_a_concern_leads_with_the_file_and_the_issue(self):
         t = D.comment_text(_rec(CONCERN, PASS))
-        self.assertIn("concern worth checking", t)
-        self.assertIn("`a/B.java`: calls postX", t)
-        self.assertIn("Opus passes", t)
+        lines = t.split("\n")
+        self.assertIn("a concern to check before signing off", lines[1])
+        self.assertEqual(lines[2], "- `B.java`: calls postX, absent on the branch (Fable)")
+        self.assertIn("**Opus** (`claude-opus-5-5`): pass.", t)
         self.assertEqual(D.summary(_rec(CONCERN, PASS)), "concern (Fable concern, Opus pass)")
 
-    def test_posted_heads_are_only_the_viewers(self):
-        body = D.MARKER.format(sha="c" * 40)
-        comments = [{"user": {"login": "me"}, "body": body},
-                    {"user": {"login": "other"}, "body": D.MARKER.format(sha="d" * 40)}]
-        self.assertEqual(D.posted_heads(comments, "me"), {"c" * 40})
+    def test_both_models_on_one_file_are_one_line_with_the_shorter_sentence(self):
+        long = {"verdict": "concern", "reason": "r", "hunks": [
+            {"file": "a/B.java", "issue": "The new test calls postX, which the branch's "
+                                          "helper does not define at this head. More."}]}
+        rows = D.concerns(_rec(long, CONCERN))
+        self.assertEqual(rows, [("a/B.java", "calls postX, absent on the branch",
+                                 ["Fable", "Opus"])])
+
+    def test_a_concern_without_hunks_uses_the_reason(self):
+        bare = {"verdict": "concern", "hunks": [], "reason": "Check the upgrade step. Rest."}
+        self.assertEqual(D.concerns(_rec(bare, PASS)), [("", "Check the upgrade step.",
+                                                         ["Fable"])])
+
+    def test_a_concern_mentions_and_a_pass_never_does(self):
+        self.assertIn("@dev 🕵", D.comment_text(_rec(CONCERN, PASS), ["dev"]))
+        self.assertNotIn("@dev", D.comment_text(_rec(PASS, PASS), ["dev"]))
+
+    def test_the_ask_line(self):
+        self.assertIn("both pass", D.ask_line(_rec(PASS, PASS)))
+        self.assertIn("raised a concern", D.ask_line(_rec(CONCERN, PASS)))
+        self.assertEqual(D.ask_line(None), "")
+
+    def test_posted_comments_read_the_layout(self):
+        comments = [{"id": 1, "user": {"login": "me"},
+                     "body": "<!-- prtriage-double-agent: " + "c" * 40 + " -->"},
+                    {"id": 2, "user": {"login": "me"}, "body": D.MARKER.format(sha="e" * 40)},
+                    {"id": 3, "user": {"login": "other"},
+                     "body": D.MARKER.format(sha="d" * 40)}]
+        self.assertEqual(D.posted_comments(comments, "me"),
+                         {"c" * 40: (1, 1), "e" * 40: (2, D.LAYOUT)})
+        self.assertEqual(D.posted_heads(comments, "me"), {"c" * 40, "e" * 40})
 
 
 class Review(unittest.TestCase):
@@ -200,10 +230,57 @@ class Board(unittest.TestCase):
             A.board_step([], "t", apply, "example-org/product", False, lambda q: "")
         return cm, lg, st
 
+    def test_an_old_layout_on_the_current_head_is_relaid(self):
+        st = _st(posted=["c" * 40])
+        st["da_comments"] = {"c" * 40: (77, 1)}
+        new = _st(head="e" * 40, posted=["e" * 40])
+        new["da_comments"] = {"e" * 40: (78, D.LAYOUT)}
+        c = self._classes(waiting=[("product", "r", "1", st), ("product", "r", "2", new)])
+        with mock.patch.object(D, "cached", return_value=_rec(PASS, PASS)):
+            got = A.double_agent_relayout(c)
+        self.assertEqual([(x[2], x[3]) for x in got], [("1", 77)])
+
+    def _relayout_board(self, apply):
+        from prtriage import github_writes
+        c = self._classes(waiting=[("product", "product", "1234", _st())])
+        row = ("product", "product", "1234", 77, _rec(CONCERN, PASS))
+        with mock.patch.object(A, "classify", return_value=c), \
+                mock.patch.object(A, "double_agent_step", return_value=[]), \
+                mock.patch.object(A, "double_agent_relayout", return_value=[row]), \
+                mock.patch.object(github_writes, "_edit_comment", return_value=True) as ed:
+            A.board_step([], "t", apply, "example-org/product", False, lambda q: "")
+        return ed
+
+    def test_a_relayout_edits_in_place_without_a_mention(self):
+        ed = self._relayout_board(True)
+        self.assertEqual(ed.call_args[0][2], 77)
+        self.assertNotIn("@", ed.call_args[0][3])
+
+    def test_a_dry_run_relays_nothing(self):
+        self._relayout_board(False).assert_not_called()
+
+    def test_the_ask_carries_the_review_line(self):
+        from prtriage import github_writes
+        st = _st()
+        st["authors"] = ["dev"]
+        c = self._classes(ask=[("product", "product", "107", st)])
+        with mock.patch.object(A, "classify", return_value=c), \
+                mock.patch.object(A, "double_agent_step",
+                                  return_value=[("product", "product", "107", st,
+                                                 _rec(CONCERN, PASS))]), \
+                mock.patch.object(A, "double_agent_relayout", return_value=[]), \
+                mock.patch.object(github_writes, "_comment", return_value=True) as cm, \
+                mock.patch.object(D, "ledger"):
+            A.board_step([], "t", True, "example-org/product", False, lambda q: "")
+        ask, review = cm.call_args_list[0][0][3], cm.call_args_list[1][0][3]
+        self.assertIn("raised a concern; see the double-agent review", ask)
+        self.assertIn("@dev 🕵", review)
+
     def test_apply_posts_the_review_and_logs_it(self):
         cm, lg, st = self._board(True)
         body = cm.call_args[0][3]
         self.assertIn("prtriage-double-agent: " + "c" * 40, body)
+        self.assertIn("@dev 🕵", body)
         lg.assert_called_once()
         self.assertIn("c" * 40, st["da_heads"])
 
