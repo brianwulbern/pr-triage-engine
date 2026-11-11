@@ -113,7 +113,7 @@ class Text(unittest.TestCase):
                     {"id": 3, "user": {"login": "other"},
                      "body": D.MARKER.format(sha="d" * 40)}]
         self.assertEqual(D.posted_comments(comments, "me"),
-                         {"c" * 40: (1, 1), "e" * 40: (2, D.LAYOUT)})
+                         {"c" * 40: (1, 1, None), "e" * 40: (2, D.LAYOUT, None)})
         self.assertEqual(D.posted_heads(comments, "me"), {"c" * 40, "e" * 40})
 
 

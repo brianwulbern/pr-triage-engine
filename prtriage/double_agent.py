@@ -24,6 +24,14 @@ LAYOUT = 2
 MARKER = "<!-- prtriage-double-agent: {sha} v%d -->" % LAYOUT
 PROMPT_VERSION = 2
 _MARKER_RE = re.compile(r"<!-- prtriage-double-agent: ([0-9a-f]{7,40})(?: v(\d+))? -->")
+BUILD_MARKER = "<!-- prtriage-double-agent-build: {build} -->"
+_BUILD_RE = re.compile(r"<!-- prtriage-double-agent-build: (\w+) -->")
+_PREVIOUS_RE = re.compile(r"Previous pull requests:\s*\n((?:\s*https://github\.com/\S+\s*\n?)+)")
+_PULL_NUM_RE = re.compile(r"github\.com/example-org/product/pull/(\d+)")
+_COMPILE_CODES = frozenset({"compile_break", "upgrade_compile_break", "ci_compile_break",
+                            "playwright_compile_break"})
+_WAIT_CODES = frozenset({"head_unbuilt", "head_ci_running", "head_ci_importing"})
+_NOT_COMPILE_FIXES = frozenset({"lang_auto_copy", "flag_gated_call"})
 _SENTENCE_RE = re.compile(r"(.+?[.!?])(?:\s|$)", re.S)
 _SECTION_RE = re.compile(r"Resolved while cherry-picking\s+https://github\.com/example-org/"
                          r"product/commit/([0-9a-f]{40})")
@@ -113,23 +121,56 @@ def regions(text: str, ctx: int = 4) -> List[str]:
     return out
 
 
+def previous_pulls(body: Optional[str]) -> List[str]:
+    """3.1.5: the pulls a resend's "Previous pull requests:" block names, newest first."""
+    out: List[str] = []
+    for block in _PREVIOUS_RE.findall(body or ""):
+        for num in reversed(_PULL_NUM_RE.findall(block)):
+            if num not in out:
+                out.append(num)
+    return out
+
+
 def match_picks(secs: List[Dict[str, Any]], commits: List[Dict[str, Any]], root: str) -> None:
     """Each section's `pick`: the pull's product-release commit with the master commit's
-    subject."""
+    subject. 3.1.5: a rebased resend's pick is committed by whoever rebased it (#1234,
+    #1234), so a commit with the subject counts when no product-release commit has it."""
     for s in secs:
         subj = (_git(root, "log", "-1", "--format=%s", s["master"]) or "").strip()
-        for c in commits:
-            msg = ((c.get("commit") or {}).get("message") or "").split("\n")[0]
-            if subj and msg == subj and \
-                    ((c.get("committer") or {}).get("login") or "") in config.AI_SIGNOFF_SHARED_LOGINS:
-                s["pick"] = c.get("sha")
-                break
+        same = [c for c in commits
+                if subj and ((c.get("commit") or {}).get("message") or "").split("\n")[0] == subj]
+        bot = [c for c in same
+               if ((c.get("committer") or {}).get("login") or "") in config.AI_SIGNOFF_SHARED_LOGINS]
+        if bot or same:
+            s["pick"] = (bot or same)[0].get("sha")
+
+
+def build_state(record: Optional[Dict[str, Any]]) -> str:
+    """3.1.5: whether CI compiled the pull at the head the board read. "failed" on a compile
+    verdict, a javac error or a compile-type quick fix (#1234's missing JUnit 4.13);
+    "unbuilt" while no build covers the head; else "compiled". Both models passed #1234 and
+    #1234, which didn't compile, so a pass counts only once CI compiled it."""
+    v = ((record or {}).get("result") or {}).get("verdict") or {}
+    if not v:
+        return "unbuilt"
+    code = v.get("reason_code") or ""
+    if code in _COMPILE_CODES or v.get("compile_errors") or any(
+            (q.get("kind") or "") not in _NOT_COMPILE_FIXES for q in v.get("quick_fixes") or []):
+        return "failed"
+    if code in _WAIT_CODES or v.get("action") == "wait" or not v.get("builds_triaged"):
+        return "unbuilt"
+    return "compiled"
 
 
 def bundle(num: str, base: str, title: str, secs: List[Dict[str, Any]], root: str,
-           commits: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+           commits: Optional[List[Dict[str, Any]]] = None,
+           origin: Optional[str] = None) -> Optional[str]:
     """The evidence both reviewers read, or None when no section matched a pick."""
     parts = [f"Pull #{num} on {base}: {title}"]
+    if origin:
+        parts.append(f"This pull resends #{origin}, whose conflicts the backport bot's model resolved. The "
+                     f"resolved commits were carried over and rebased onto the current base, "
+                     f"so a resolution below can also include changes made while rebasing.")
     if not any(s.get("pick") for s in secs):
         return None
     for s in secs:
@@ -238,9 +279,11 @@ def _ask(model: str, prompt: str, root: str) -> Dict[str, Any]:
 
 
 def review(num: str, head: str, base: str, title: str, body: str,
-           commits: List[Dict[str, Any]], root: str) -> Optional[Dict[str, Any]]:
+           commits: List[Dict[str, Any]], root: str,
+           origin: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Both verdicts for `num` at `head`, cached on disk per head. None when there is no
-    evidence to review or a model gave no usable answer (nothing is cached then)."""
+    evidence to review or a model gave no usable answer (nothing is cached then). `body` is
+    the resent pull's own body when `origin` is set."""
     path = os.path.join(_dir(), f"{num}-{head[:12]}-v{PROMPT_VERSION}.json")
     if os.path.exists(path):
         try:
@@ -252,7 +295,7 @@ def review(num: str, head: str, base: str, title: str, body: str,
     if not secs:
         return None
     match_picks(secs, commits, root)
-    ev = bundle(num, base, title, secs, root, commits)
+    ev = bundle(num, base, title, secs, root, commits, origin)
     if not ev:
         return None
     prompt = INSTR.replace("{REF}", head).replace("{BASE}", base) + ev
@@ -260,7 +303,7 @@ def review(num: str, head: str, base: str, title: str, body: str,
         got = list(ex.map(lambda m: _ask(m[1], prompt, root), config.DOUBLE_AGENT_MODELS))
     if not all(g["answer"] for g in got):
         return None
-    rec = {"pr": num, "head": head, "base": base,
+    rec = {"pr": num, "head": head, "base": base, **({"origin": origin} if origin else {}),
            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
            "reviews": [dict(g, name=n) for g, (n, _m) in zip(got, config.DOUBLE_AGENT_MODELS)]}
     with open(path, "w") as fh:
@@ -272,8 +315,14 @@ def both_pass(rec: Dict[str, Any]) -> bool:
     return all((r.get("answer") or {}).get("verdict") == "pass" for r in rec["reviews"])
 
 
-def summary(rec: Dict[str, Any]) -> str:
+_NOT_COUNTED = {"unbuilt": "CI hasn't compiled this head yet",
+                "failed": "CI found a compile problem at this head"}
+
+
+def summary(rec: Dict[str, Any], build: Optional[str] = None) -> str:
     v = ", ".join(f"{r['name']} {(r['answer'] or {}).get('verdict')}" for r in rec["reviews"])
+    if both_pass(rec) and build in _NOT_COUNTED:
+        return f"both pass, not counted yet: {_NOT_COUNTED[build]} ({v})"
     return ("both pass" if both_pass(rec) else "concern") + f" ({v})"
 
 
@@ -315,15 +364,25 @@ def concerns(rec: Dict[str, Any]) -> List[Tuple[str, str, List[str]]]:
     return [(f, line, names) for f, (line, names) in rows.items()]
 
 
-def comment_text(rec: Dict[str, Any], mention: Optional[List[str]] = None) -> str:
+def comment_text(rec: Dict[str, Any], mention: Optional[List[str]] = None,
+                 build: Optional[str] = None) -> str:
     """3.1.2: the verdict first, each model's full review folded below it. `mention` pings
-    the people the sign-off ask pings, only on a concern."""
+    the people the sign-off ask pings, only on a concern. 3.1.5: `build` says whether CI
+    compiled this head; a pass is only presented as one once it did."""
     head = rec["head"]
-    out = [MARKER.format(sha=head)]
-    if both_pass(rec):
+    out = [MARKER.format(sha=head) + (BUILD_MARKER.format(build=build) if build else "")]
+    if both_pass(rec) and build == "unbuilt":
+        out.append(f"🕵 **Double-agent review: both models pass, but CI hasn't compiled "
+                   f"{head[:10]} yet.** The models read the resolution, not the build, so this "
+                   f"pass counts once CI compiles this head.")
+    elif both_pass(rec) and build == "failed":
+        out.append(f"🕵 **Double-agent review: both models pass, but CI found a compile problem "
+                   f"at {head[:10]}.** The models read the resolution, not the build; see prtriage's "
+                   f"verdict on this pull for the compile problem.")
+    elif both_pass(rec):
         out.append(f"🕵 **Double-agent review: both models pass.** Fable and Opus each "
                    f"reviewed this conflict resolution on their own and found nothing wrong "
-                   f"at {head[:10]}.")
+                   f"at {head[:10]}" + (", and CI compiled it." if build == "compiled" else "."))
     else:
         rows = concerns(rec)
         who = " ".join(f"@{a}" for a in mention or [])
@@ -348,10 +407,13 @@ def comment_text(rec: Dict[str, Any], mention: Optional[List[str]] = None) -> st
     return "\n".join(out).replace("\u2014", ",")
 
 
-def ask_line(rec: Optional[Dict[str, Any]]) -> str:
+def ask_line(rec: Optional[Dict[str, Any]], build: Optional[str] = None) -> str:
     """3.1.2: what a sign-off ask or reminder says about the review on the same pull."""
     if not rec:
         return ""
+    if both_pass(rec) and build in _NOT_COUNTED:
+        return (f"\n\nTwo models also reviewed the resolution here and both pass, but "
+                f"{_NOT_COUNTED[build]}; see the double-agent review on this pull.")
     if both_pass(rec):
         return ("\n\nTwo models also reviewed the resolution here and both pass; see the "
                 "double-agent review on this pull.")
@@ -364,24 +426,27 @@ def posted_heads(comments: List[Dict[str, Any]], viewer: Optional[str]) -> set:
 
 
 def posted_comments(comments: List[Dict[str, Any]], viewer: Optional[str]
-                    ) -> Dict[str, Tuple[Any, int]]:
-    """{head: (comment id, layout)} for the viewer's double-agent comments; layout 1 is the
-    3.1.0 comment, which had no version in its marker."""
+                    ) -> Dict[str, Tuple[Any, int, Optional[str]]]:
+    """{head: (comment id, layout, build state or None)} for the viewer's double-agent
+    comments; layout 1 is the 3.1.0 comment, which had no version in its marker."""
     me = (viewer or "").lower()
-    out: Dict[str, Tuple[Any, int]] = {}
+    out: Dict[str, Tuple[Any, int, Optional[str]]] = {}
     for c in comments or []:
         if ((c.get("user") or {}).get("login") or "").lower() != me:
             continue
-        m = _MARKER_RE.search(c.get("body") or "")
+        body = c.get("body") or ""
+        m = _MARKER_RE.search(body)
         if m:
-            out[m.group(1)] = (c.get("id"), int(m.group(2) or 1))
+            b = _BUILD_RE.search(body)
+            out[m.group(1)] = (c.get("id"), int(m.group(2) or 1), b.group(1) if b else None)
     return out
 
 
-def ledger(rec: Dict[str, Any], compile_label: bool) -> None:
+def ledger(rec: Dict[str, Any], compile_label: bool, build: Optional[str] = None) -> None:
     row = {"pr": rec["pr"], "head": rec["head"], "base": rec["base"], "at": rec["at"],
            "verdicts": {r["name"]: (r["answer"] or {}).get("verdict") for r in rec["reviews"]},
-           "both_pass": both_pass(rec), "compile_label": compile_label}
+           "both_pass": both_pass(rec), "compile_label": compile_label, "build": build,
+           **({"origin": rec["origin"]} if rec.get("origin") else {})}
     try:
         with open(os.path.join(_dir(), "ledger.jsonl"), "a") as fh:
             fh.write(json.dumps(row) + "\n")

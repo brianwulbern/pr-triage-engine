@@ -384,6 +384,17 @@ def _members(org: str, token: Optional[str]) -> Callable[[str], bool]:
     return check
 
 
+def ci_compile_failures(comments: List[Dict[str, Any]], since: str) -> List[str]:
+    """3.1.6: the compile tasks the CI bot reported FAILED after the head was committed.
+    A bundle job can fail on a compile task the test report cuts off, so the verdict reads as
+    a bundle failure and the double agent would count a pass."""
+    from . import comments as cm
+    return [t for c in comments or []
+            if cm._is_ci_bot_login((c.get("user") or {}).get("login"))
+            and (c.get("created_at") or "") > (since or "")
+            for t in cm.parse_ci_compile_failures(c.get("body") or "")]
+
+
 def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[str, Any]:
     """Everything the hold needs about one pull. {"ai": False} for a pull without the label;
     "readable": False when anything needed couldn't be read (the pull then holds)."""
@@ -432,6 +443,7 @@ def pull_state(owner: str, repo: str, num: str, token: Optional[str]) -> Dict[st
     st["noticed"] = any(ours(c, _MARKER) for c in comments)
     st["da_comments"] = double_agent.posted_comments(comments, viewer)
     st["da_heads"] = set(st["da_comments"])
+    st["ci_compile"] = ci_compile_failures(comments, head_at)
     asks = [c.get("created_at") or "" for c in comments if ours(c, _MARKER)]
     reminders = [c.get("created_at") or "" for c in comments if ours(c, _REMIND_MARKER)]
     st["asked_at"] = min([a for a in asks if a], default="")
@@ -708,6 +720,14 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     c = classify(records, token, repo_filter, replaced=replaced)
     if not any(c.values()):
         return
+    builds = {}
+    for rec in records:
+        m = comments._PR_PARTS_REGEX.match(((rec.get("_audit") or {}).get("target") or "").strip())
+        if m:
+            builds.setdefault(m.group(3), double_agent.build_state(rec))
+    for rows in c.values():
+        for _o, _r, num, st in rows:
+            st["build"] = "failed" if st.get("ci_compile") else builds.get(num, "unbuilt")
     print("\n" + "─" * 70)
     print(f"🤖 AI-resolved conflicts (`{config.AI_CONFLICT_LABEL}`): held until a person other "
           f"than you signs off")
@@ -804,7 +824,8 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
                 body = (text(st) + group_text([x[2] for x in rows[1:]]) if i == 0
                         else pointer_text(first, "remind" if kind == "sibling" else kind, st))
                 body += double_agent.ask_line(
-                    da_recs.get(num) or double_agent.cached(num, st.get("head") or ""))
+                    da_recs.get(num) or double_agent.cached(num, st.get("head") or ""),
+                    st.get("build"))
                 ok = github_writes._comment(token, full(o, r), num, f"{marker}\n{body}")
                 verb = "asked" if kind == "ask" else "reminded"
                 print(f"    {'→' if kind == 'ask' else '🔔'} #{num}  "
@@ -813,14 +834,15 @@ def board_step(records: List[Dict[str, Any]], token: Optional[str], apply: bool,
     for o, r, num, st, rec in reviews:
         mention = None if double_agent.both_pass(rec) else (st.get("authors") or [])
         ok = github_writes._comment(token, full(o, r), num,
-                                  double_agent.comment_text(rec, mention))
+                                  double_agent.comment_text(rec, mention, st.get("build")))
         if ok:
-            double_agent.ledger(rec, bool(st.get("compile_label")))
+            double_agent.ledger(rec, bool(st.get("compile_label")), st.get("build"))
             st.setdefault("da_heads", set()).add(rec["head"])
         print(f"    🕵 #{num}  " + ("double-agent review posted" if ok
                                    else "couldn't post the double-agent review"))
-    for o, r, num, cid, rec in relayout:
-        ok = github_writes._edit_comment(token, full(o, r), cid, double_agent.comment_text(rec))
+    for o, r, num, cid, rec, *build in relayout:
+        ok = github_writes._edit_comment(token, full(o, r), cid,
+                                       double_agent.comment_text(rec, None, (build or [None])[0]))
         print(f"    🕵 #{num}  " + ("double-agent review updated to the current layout" if ok
                                    else "couldn't update the double-agent review"))
 
@@ -831,16 +853,21 @@ _DA_KINDS = ("ask", "remind", "sibling", "waiting", "overdue", "replied", "rehol
 def double_agent_relayout(c: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]]
                           ) -> List[Tuple[str, str, str, Any, Dict[str, Any]]]:
     """3.1.2: the review on a held pull's current head, posted in an older layout, is edited
-    in place to the current one (no mentions, so nobody is notified again)."""
+    in place to the current one (no mentions, so nobody is notified again). 3.1.5: also when
+    CI's compile state for that head changed since it was posted."""
     out = []
     for k in _DA_KINDS:
         for o, r, num, st in c[k]:
             got = (st.get("da_comments") or {}).get(st.get("head") or "")
-            if not got or got[1] >= double_agent.LAYOUT:
+            if not got:
+                continue
+            build = st.get("build")
+            posted = got[2] if len(got) > 2 else None
+            if got[1] >= double_agent.LAYOUT and (not build or posted == build):
                 continue
             rec = double_agent.cached(num, st["head"])
             if rec:
-                out.append((o, r, num, got[0], rec))
+                out.append((o, r, num, got[0], rec, build))
     return sorted(out, key=lambda x: int(x[2]))
 
 
@@ -864,21 +891,44 @@ def double_agent_step(c: Dict[str, List[Tuple[str, str, str, Dict[str, Any]]]],
         o, r, num, st = row
         if not double_agent.ensure_local(root, o, r, num, st["head"]):
             return None
+        body, origin = resolution_body(o, r, st.get("body") or "", token)
         return double_agent.review(num, st["head"], st.get("base") or "", st.get("title") or "",
-                                   st.get("body") or "", st.get("commits") or [], root)
+                                   body, st.get("commits") or [], root, origin)
 
     with cf.ThreadPoolExecutor(config.DOUBLE_AGENT_CONCURRENCY) as ex:
         got = list(ex.map(one, rows))
     out = []
     for row, rec in zip(rows, got):
         if not rec:
-            print(f"    🕵 #{row[2]}  double agent: no review (no backport-bot section matched, or a "
-                  f"model gave no answer)")
+            print(f"    🕵 #{row[2]}  double agent: no review (no backport-bot section on this pull or "
+                  f"the pulls it resends, or a model gave no answer)")
             continue
         flag = " + compile label" if row[3].get("compile_label") else ""
-        print(f"    🕵 #{row[2]}  double agent: {double_agent.summary(rec)}{flag}")
+        via = f", via #{rec['origin']}'s backport-bot section" if rec.get("origin") else ""
+        print(f"    🕵 #{row[2]}  double agent: "
+              f"{double_agent.summary(rec, row[3].get('build'))}{via}{flag}")
         out.append(row + (rec,))
     return out
+
+
+def resolution_body(owner: str, repo: str, body: str, token: Optional[str],
+                    hops: int = 3) -> Tuple[str, Optional[str]]:
+    """3.1.5: the body that carries the backport bot's resolution sections, and the pull it came from. A
+    resend (#1234, #1234) names its original under "Previous pull requests:" and keeps
+    only its own text, so the original's body is read, up to `hops` resends back."""
+    num: Optional[str] = None
+    seen: set = set()
+    for _ in range(hops + 1):
+        if double_agent.sections(body):
+            return body, num
+        prev = [p for p in double_agent.previous_pulls(body) if p not in seen]
+        if not prev:
+            break
+        num = prev[0]
+        seen.add(num)
+        pull = _get(f"{_API}/{owner}/{repo}/pulls/{num}", token)
+        body = (pull or {}).get("body") or "" if isinstance(pull, dict) else ""
+    return "", None
 
 
 def by_authors(rows: List[Tuple[str, str, str, Dict[str, Any]]]

@@ -56,6 +56,27 @@ def _pr_current_state(owner: str, repo: str, number, token: Optional[str],
         return None
 
 
+# 2.38.0: a confirmed compile-task failure named inline in the CI-bot comment, e.g.
+# `:apps:example:example-impl:compileJava FAILED`. The raw javac line lives in a console the
+# API can't read, but the bot comment naming the failed Gradle task is reachable, so the
+# task path is captured to name the module and cross-check it against the diff.
+_CI_COMPILE_FAIL_RE = re.compile(
+    r"(:[\w.\-]+(?::[\w.\-]+)*:compile\w*)\s+FAILED", re.IGNORECASE)
+
+
+def parse_ci_compile_failures(body: str) -> List[str]:
+    """Confirmed compile-task failures (`…:compile*Java FAILED`) named in a CI-bot
+    comment body - de-duplicated in first-seen order. [] when none."""
+    if not body:
+        return []
+    out: List[str] = []
+    for m in _CI_COMPILE_FAIL_RE.finditer(body):
+        task = m.group(1).strip()
+        if task and task not in out:
+            out.append(task)
+    return out
+
+
 # Logins that are never the person to @-mention for action: the CI/forwarding
 # automation (ci-bot*) and upstream-fork (the fork the
 # backport is forwarded INTO - it shows up as a commit author by artifact, not because
