@@ -43,9 +43,12 @@ _REMIND_MARKER = "<!-- prtriage-ai-review-reminder -->"
 # the test passes" doesn't count). Trailing thanks and emoji are allowed. 3.0.51: also a short
 # "tested it locally and it looks good" with a leading mention (dev-r, #1234/#1234).
 # 3.0.84: also after a greeting ("Hi @release-mgr\nLGTM", dev-n on #1234).
+# 3.1.7: quoted lines are the ask being answered, not the reply, and "No SF issues, LGTM."
+# counts (dev-y on #1234/#1234).
 _GREETING_RE = re.compile(r"^(?:hi|hello|hey|hola)\b[\s,!]*(?:@[\w-]+[\s,:]*)*", re.IGNORECASE)
 _LGTM_RE = re.compile(
     r"^(?:@[\w-]+[\s,:]*)*(?:(?:thanks|thank you)[\s,.!]*)?"
+    r"(?:no\s+(?:[\w-]+\s+){0,3}(?:issues?|problems?|concerns?)[\s,.;:]*)?"
     r"(?:(?:i\s+)?(?:tested|checked|reviewed|verified)\s+(?:this|it|the\s+(?:resolution|changes?|pull|pr))"
     r"(?:\s+locally)?(?:\s+too)?[\s,]*(?:and\s+)?)?"
     r"(?:lgtm|(?:(?:all|it|everything)\s+)?looks?\s+good(?:\s+to\s+me)?)"
@@ -68,7 +71,8 @@ def is_ai_resolved(labels: Optional[Iterable[str]]) -> bool:
 def is_lgtm(body: Optional[str]) -> bool:
     if not body or body.lstrip().startswith("<!-- prtriage-"):
         return False
-    text = "".join(ch for ch in body if ord(ch) < 0x2000).strip()   # drop emoji
+    text = "".join(ch for ch in body if ord(ch) < 0x2000)   # drop emoji
+    text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith(">")).strip()
     text = _GREETING_RE.sub("", text, count=1)
     if _LGTM_RE.match(text):
         return True
