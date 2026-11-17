@@ -114,6 +114,14 @@ newer than the pull's head. A push after the sign-off holds it again.
 * **Team routing.** A pull that changes code CODEOWNERS gives a team, or that a team member wrote,
   asks that team's designated reviewer instead of each author.
 
+### Waiting on a person (`prtriage/waiting.py`)
+
+A pull can pass every check and still not be ready, because someone asked a question about it.
+Two signals keep a green out of the forward set: a teammate labeled it `waiting_for_dev` after its
+latest push (the tool's own hand-back label doesn't count), or your latest plain comment on it asks
+an @-mentioned person something and none of them has replied, reviewed, or pushed since. The board
+lists these with the reason instead of dropping them silently.
+
 ### Re-run reconciliation (`prtriage/run_reconciliation.py`)
 
 A pull's trigger is often built more than once. Comparing a test across those runs is the strongest
@@ -149,6 +157,7 @@ prtriage/
   board.py             concurrent readiness board
   board_limits.py      rate-limit preflight and early-abort decisions
   ai_review.py         sign-off hold for AI-resolved merge conflicts
+  waiting.py           holds a ready pull that is waiting on a person's answer
   run_reconciliation.py  cross-run reconciliation of a pull's re-runs
   build_transition.py  a build's tests split by outcome
   github_writes.py     the comment write the sign-off hold uses
