@@ -45,13 +45,15 @@ _REMIND_MARKER = "<!-- prtriage-ai-review-reminder -->"
 # 3.0.84: also after a greeting ("Hi @release-mgr\nLGTM", dev-n on #1234).
 # 3.1.7: quoted lines are the ask being answered, not the reply, and "No SF issues, LGTM."
 # counts (dev-y on #1234/#1234).
+# 3.1.15: also "changes looks good to me" and the like (dev-z on #1234).
 _GREETING_RE = re.compile(r"^(?:hi|hello|hey|hola)\b[\s,!]*(?:@[\w-]+[\s,:]*)*", re.IGNORECASE)
 _LGTM_RE = re.compile(
     r"^(?:@[\w-]+[\s,:]*)*(?:(?:thanks|thank you)[\s,.!]*)?"
     r"(?:no\s+(?:[\w-]+\s+){0,3}(?:issues?|problems?|concerns?)[\s,.;:]*)?"
     r"(?:(?:i\s+)?(?:tested|checked|reviewed|verified)\s+(?:this|it|the\s+(?:resolution|changes?|pull|pr))"
     r"(?:\s+locally)?(?:\s+too)?[\s,]*(?:and\s+)?)?"
-    r"(?:lgtm|(?:(?:all|it|everything)\s+)?looks?\s+good(?:\s+to\s+me)?)"
+    r"(?:lgtm|(?:(?:all|it|everything|this(?:\s+(?:one|pr|pull))?|(?:the\s+)?(?:changes?|"
+    r"resolution|code|fix|diff))\s+)?looks?\s+good(?:\s+to\s+me)?)"
     r"[\s,.!:]*(?:(?:thanks|thank you|ty)[\s.!]*)?$",
     re.IGNORECASE)
 # 3.0.63: "LGTM." followed by an explanation counts when the explanation carries no condition,
